@@ -137,6 +137,69 @@ def get_video_dimensions(video_path: Path) -> tuple[int, int]:
     except Exception:
         return 1920, 1080
 
+def format_srt_timestamp(seconds: float) -> str:
+    """Seconds -> SRT timestamp 'HH:MM:SS,mmm'."""
+    if seconds < 0:
+        seconds = 0.0
+    total_ms = int(round(seconds * 1000))
+    h, rem = divmod(total_ms, 3600000)
+    m, rem = divmod(rem, 60000)
+    s, ms = divmod(rem, 1000)
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+
+def generate_srt(
+    moment: ViralMoment,
+    all_segments: List[TranscriptSegment],
+    output_srt_path: Path,
+    max_chars: int = 42,
+) -> Path:
+    """
+    Plain .srt subtitle file for ONE clip (timings relative to the clip start).
+    Nothing is burned into the video - this is a sidecar file you can upload or
+    edit yourself.
+    """
+    start_offset, end_offset = moment.start_time, moment.end_time
+    blocks: List[str] = []
+    index = 1
+
+    for seg in all_segments:
+        if not (seg.end > start_offset and seg.start < end_offset):
+            continue
+        c_start = max(seg.start, start_offset) - start_offset
+        c_end = min(seg.end, end_offset) - start_offset
+        if c_end <= c_start:
+            continue
+
+        words = seg.text.split()
+        if not words:
+            continue
+
+        # split long caption lines into readable sub-lines with proportional timing
+        chunks: List[str] = []
+        cur: List[str] = []
+        for w in words:
+            cur.append(w)
+            if len(" ".join(cur)) >= max_chars:
+                chunks.append(" ".join(cur))
+                cur = []
+        if cur:
+            chunks.append(" ".join(cur))
+
+        per = (c_end - c_start) / len(chunks)
+        for i, chunk in enumerate(chunks):
+            t0 = c_start + i * per
+            t1 = (c_end if i == len(chunks) - 1 else t0 + per)
+            if t1 - t0 < 0.2:
+                t1 = t0 + 0.2
+            blocks.append(f"{index}\n{format_srt_timestamp(t0)} --> {format_srt_timestamp(t1)}\n{chunk}\n")
+            index += 1
+
+    output_srt_path.parent.mkdir(parents=True, exist_ok=True)
+    output_srt_path.write_text("\n".join(blocks), encoding="utf-8")
+    return output_srt_path
+
+
 def render_reel(
     source_video_path: Path,
     moment: ViralMoment,
@@ -242,3 +305,98 @@ def render_reel(
             pass
 
     return output_file
+
+
+def cut_clip_916(
+    source_video_path: Path,
+    start_time: float,
+    end_time: float,
+    output_file: Path,
+    canvas_w: int = TARGET_WIDTH,
+    canvas_h: int = TARGET_HEIGHT,
+) -> Path:
+    """
+    Deliver ONE clip as an unedited 9:16 vertical video.
+
+    "Unedited" = the picture is exactly what the source has: full width kept,
+    scaled onto a 1080x1920 canvas with black bars top/bottom. No subtitles,
+    no banners, no text overlays - you edit it yourself.
+
+    Fast path: if the source is already <=1080 wide and <=1920 tall (i.e. a true
+    vertical video) the stream is copied with NO re-encode at all, so quality is
+    bit-for-bit identical to the source. Otherwise a high-quality single re-encode
+    (crf 17, slow preset) keeps the result crisp.
+    """
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    duration = end_time - start_time
+    if duration <= 0:
+        raise ValueError(f"Invalid clip range: {start_time} -> {end_time}")
+
+    src_dur = get_video_duration(source_video_path)
+    if src_dur > 0:
+        if start_time >= src_dur:
+            raise ValueError(
+                f"Start time ({start_time:.1f}s) exceeds video length ({src_dur:.1f}s)."
+            )
+        if end_time > src_dur:
+            duration = src_dur - start_time
+
+    w, h = get_video_dimensions(source_video_path)
+    already_vertical_fit = (w <= canvas_w and h <= canvas_h) or (h >= w and abs(w / h - canvas_w / canvas_h) < 0.01)
+
+    temp_render_path = output_file.with_suffix(".rendering.mp4")
+    base = [
+        "ffmpeg", "-y",
+        "-ss", f"{start_time:.3f}",
+        "-i", str(source_video_path),
+        "-t", f"{duration:.3f}",
+        "-map", "0:v:0", "-map", "0:a?",
+    ]
+
+    try:
+        if already_vertical_fit:
+            # Zero quality loss: stream copy, keyframe-snapped cut.
+            cmd = base + ["-c", "copy", "-avoid_negative_ts", "make_zero", str(temp_render_path)]
+        else:
+            vf = (
+                f"scale={canvas_w}:{canvas_h}:force_original_aspect_ratio=decrease:flags=lanczos,"
+                f"pad={canvas_w}:{canvas_h}:(ow-iw)/2:(oh-ih)/2:black"
+            )
+            cmd = base + [
+                "-vf", vf,
+                "-c:v", "libx264", "-preset", "slow", "-crf", "17",
+                "-c:a", "aac", "-b:a", "192k",
+                "-pix_fmt", "yuv420p",
+                "-movflags", "+faststart",
+                str(temp_render_path),
+            ]
+        process = subprocess.run(cmd, capture_output=True, text=True)
+        ok = process.returncode == 0 and temp_render_path.exists() and temp_render_path.stat().st_size > 50_000
+        if not ok and not already_vertical_fit:
+            raise RuntimeError(f"FFmpeg cut failed:\n{process.stderr[-1200:]}")
+
+        if not ok:
+            # stream copy produced junk (rare codec mismatch) -> fall back to re-encode
+            vf = (
+                f"scale={canvas_w}:{canvas_h}:force_original_aspect_ratio=decrease:flags=lanczos,"
+                f"pad={canvas_w}:{canvas_h}:(ow-iw)/2:(oh-ih)/2:black"
+            )
+            cmd = base + [
+                "-vf", vf,
+                "-c:v", "libx264", "-preset", "slow", "-crf", "17",
+                "-c:a", "aac", "-b:a", "192k",
+                "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+                str(temp_render_path),
+            ]
+            process = subprocess.run(cmd, capture_output=True, text=True)
+            if process.returncode != 0 or not temp_render_path.exists():
+                raise RuntimeError(f"FFmpeg cut failed:\n{process.stderr[-1200:]}")
+
+        temp_render_path.replace(output_file)
+        return output_file
+    finally:
+        if temp_render_path.exists():
+            try:
+                temp_render_path.unlink()
+            except Exception:
+                pass

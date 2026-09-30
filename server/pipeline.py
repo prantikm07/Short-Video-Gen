@@ -1,224 +1,233 @@
 #!/usr/bin/env python3
-import os
+"""
+ViralReel AI - End-to-end pipeline (CLI)
+
+1. Paste a YouTube link
+2. Choose min/max clip length in seconds
+3. Choose how many reels (up to 10)
+
+The app finds the hooks + best parts and delivers, for every reel:
+  * a hooking title
+  * a ready-to-post social caption
+  * the timeline of that part (e.g. 03:25 - 04:10)
+  * the subtitles of that part as a .srt file
+  * the part itself, cut as an unedited 9:16 high quality video (no burned text)
+
+Usage:
+    python server/pipeline.py --url "https://youtu.be/VIDEO_ID" --count 5 --min 45 --max 70
+    python server/pipeline.py --url "..." --dry-run          # analysis only, no download
+    python server/pipeline.py                                # interactive mode
+"""
+
 import sys
-import re
 import argparse
 from pathlib import Path
-from rich.console import Console
-from rich.table import Table
-from rich.panel import Panel
-from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeRemainingColumn
-from rich import print as rprint
+from typing import List, Optional
 
-from config import (
-    TEMP_DIR,
-    OUTPUT_DIR,
-    GEMINI_API_KEY,
-    ANTHROPIC_API_KEY,
-    DEFAULT_MIN_DURATION,
-    DEFAULT_MAX_DURATION,
-)
-from downloader import (
-    extract_video_id,
-    get_video_info,
-    get_transcript,
-    format_transcript_for_prompt,
-    download_video,
-)
-from viral_detector import detect_viral_moments
-from video_processor import render_reel
+CURRENT_DIR = Path(__file__).resolve().parent
+ROOT_DIR = CURRENT_DIR.parent
+for path_str in [str(CURRENT_DIR), str(ROOT_DIR)]:
+    if path_str not in sys.path:
+        sys.path.insert(0, path_str)
+
+from rich.console import Console
+from rich.panel import Panel
+from rich.table import Table
+from rich.markdown import Markdown
+from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn
+
+from config import TEMP_DIR, OUTPUT_DIR, DEFAULT_MIN_DURATION, DEFAULT_MAX_DURATION
+from downloader import extract_video_id, get_video_info, get_transcript, download_video
+from models import TranscriptSegment, ViralMoment
+from viral_detector import detect_viral_moments, format_seconds
+from video_processor import cut_clip_916, generate_srt
 
 console = Console()
 
-def sanitize_filename(name: str) -> str:
-    """Sanitize string for file naming."""
-    name = re.sub(r'[^\w\s-]', '', name).strip()
-    return re.sub(r'[-\s]+', '_', name)[:40]
 
-def format_seconds(seconds: float) -> str:
-    """Convert seconds to mm:ss format."""
-    m, s = divmod(int(seconds), 60)
-    return f"{m:02d}:{s:02d}"
+def _clip_stem(index: int, moment: ViralMoment) -> str:
+    import re
+    safe = re.sub(r"[^\w\s-]", "", moment.title or "").strip()
+    safe = re.sub(r"[-\s]+", "_", safe)[:45] or "clip"
+    return f"{index:02d}_{safe}_{int(moment.start_time)}-{int(moment.end_time)}s"
 
-def display_banner():
-    banner = """
-    [bold cyan]╔══════════════════════════════════════════════════════════════╗[/bold cyan]
-    [bold cyan]║[/bold cyan]  [bold yellow]⚡ YOUTUBE TO VIRAL REELS AI PIPELINE ⚡[/bold yellow]                    [bold cyan]║[/bold cyan]
-    [bold cyan]║[/bold cyan]  [dim]Turn long YouTube videos into viral 9:16 Shorts & Reels[/dim]     [bold cyan]║[/bold cyan]
-    [bold cyan]║[/bold cyan]  [dim]Powered by Gemini 2.5 Flash / Claude 3.7 Sonnet & FFmpeg[/dim]    [bold cyan]║[/bold cyan]
-    [bold cyan]╚══════════════════════════════════════════════════════════════╝[/bold cyan]
-    """
-    console.print(banner)
 
-def check_keys(engine: str):
-    """Verify appropriate API keys exist."""
-    has_gemini = bool(GEMINI_API_KEY)
-    has_anthropic = bool(ANTHROPIC_API_KEY)
+def deliver_clips(video_url: str, moments: List[ViralMoment], segments: List[TranscriptSegment],
+                  batch_dir: Path, keep_source: bool = False) -> List[dict]:
+    """Cut every moment into an unedited 9:16 mp4 + write its .srt / title / caption files."""
+    batch_dir.mkdir(parents=True, exist_ok=True)
+    video_id = extract_video_id(video_url)
+    source_path = TEMP_DIR / f"{video_id}.mp4"
 
-    if engine == "gemini" and not has_gemini:
-        console.print("[bold red]Error:[/bold red] GEMINI_API_KEY is not set in your .env file.")
-        console.print("Please add it to .env: [green]GEMINI_API_KEY=your_key_here[/green]")
-        sys.exit(1)
-    elif engine == "anthropic" and not has_anthropic:
-        console.print("[bold red]Error:[/bold red] ANTHROPIC_API_KEY is not set in your .env file.")
-        console.print("Please add it to .env: [green]ANTHROPIC_API_KEY=your_key_here[/green]")
-        sys.exit(1)
-    elif engine == "auto" and not (has_gemini or has_anthropic):
-        console.print("[bold red]Error:[/bold red] No API key detected!")
-        console.print("Please provide at least [yellow]GEMINI_API_KEY[/yellow] or [yellow]ANTHROPIC_API_KEY[/yellow] in your .env file.")
-        sys.exit(1)
+    with Progress(SpinnerColumn(), TextColumn("[bold blue]{task.description}"),
+                  BarColumn(), console=console, transient=False) as progress:
+        task = progress.add_task("Downloading source video (max resolution)...", total=None)
+        if not (source_path.exists() and source_path.stat().st_size > 1_000_000):
+            download_video(video_url, source_path)
+        progress.update(task, description="Source ready.")
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Automated pipeline to find viral moments from YouTube videos and render vertical 9:16 reels."
-    )
-    parser.add_argument("--url", "-u", type=str, help="YouTube video URL")
-    parser.add_argument("--count", "-c", type=int, default=3, help="Number of viral reels to produce (default: 3)")
-    parser.add_argument("--engine", "-e", choices=["auto", "gemini", "anthropic"], default="auto", help="AI Engine (default: auto)")
-    parser.add_argument("--min-duration", type=float, default=DEFAULT_MIN_DURATION, help="Minimum reel duration in seconds (default: 20)")
-    parser.add_argument("--max-duration", type=float, default=DEFAULT_MAX_DURATION, help="Maximum reel duration in seconds (default: 60)")
-    parser.add_argument("--output-dir", "-o", type=str, default=str(OUTPUT_DIR), help="Output directory for generated reels")
-    parser.add_argument("--with-subtitles", action="store_true", default=False, help="Burn external subtitles (disabled by default)")
-    parser.add_argument("--with-banner", action="store_true", default=False, help="Add top hook headline banner (disabled by default)")
-    parser.add_argument("--dry-run", action="store_true", help="Only analyze and list viral moments without rendering video")
+        delivered: List[dict] = []
+        for i, m in enumerate(moments, start=1):
+            stem = _clip_stem(i, m)
+            out_video = batch_dir / f"{stem}.mp4"
+            progress.update(task, description=f"Cutting reel {i}/{len(moments)} ({m.timeline})...")
+            try:
+                cut_clip_916(source_path, m.start_time, m.end_time, out_video)
+            except Exception as e:
+                console.print(f"[bold red]✗ Reel {i} failed:[/] {e}")
+                continue
 
-    args = parser.parse_args()
+            srt_path = None
+            if segments:
+                srt_path = batch_dir / f"{stem}.srt"
+                try:
+                    generate_srt(m, segments, srt_path)
+                except Exception as e:
+                    console.print(f"[yellow]⚠ SRT failed for reel {i}: {e}[/yellow]")
+                    srt_path = None
 
-    display_banner()
-    check_keys(args.engine)
+            (batch_dir / f"{stem}_title.txt").write_text(f"{m.title}\n({m.timeline})\n", encoding="utf-8")
+            (batch_dir / f"{stem}_caption.txt").write_text(f"{m.caption}\n", encoding="utf-8")
 
-    # 1. Prompt URL if not provided
-    url = args.url
-    if not url:
-        url = console.input("[bold yellow]Enter YouTube Video URL:[/bold yellow] ").strip()
-        if not url:
-            console.print("[red]No URL provided. Exiting.[/red]")
-            sys.exit(1)
+            size_mb = round(out_video.stat().st_size / (1024 * 1024), 2)
+            delivered.append({"index": i, "moment": m, "video": out_video, "srt": srt_path, "size_mb": size_mb})
+            console.print(f"[bold green]✓ Reel {i}[/] {out_video.name}  ({size_mb} MB, {m.duration:.0f}s)")
 
-    output_path = Path(args.output_dir)
-    output_path.mkdir(parents=True, exist_ok=True)
+    if not keep_source and source_path.exists():
+        try:
+            source_path.unlink()
+        except Exception:
+            pass
+    return delivered
 
-    # 2. Extract Video Info & Transcript
+
+def print_package(delivered: List[dict], batch_dir: Path):
+    table = Table(title="Your clips", show_lines=True)
+    table.add_column("#", style="cyan", width=3)
+    table.add_column("Title", style="bold white", overflow="fold")
+    table.add_column("Timeline", style="green", width=16)
+    table.add_column("Files", style="magenta", overflow="fold")
+    for d in delivered:
+        m: ViralMoment = d["moment"]
+        files = Path(d["video"]).name
+        if d.get("srt"):
+            files += f"\n{Path(d['srt']).name}"
+        table.add_row(str(d["index"]), m.title, m.timeline, files)
+    console.print(table)
+    for d in delivered:
+        m: ViralMoment = d["moment"]
+        console.print(Panel.fit(
+            f"[bold]{m.title}[/]\n[dim]Caption:[/] {m.caption}",
+            title=f"Reel {d['index']} · {m.timeline} · 🔥{m.viral_score}",
+            border_style="red",
+        ))
+    console.print(f"\n[bold green]All files saved in:[/] {batch_dir}\n")
+
+
+def run_pipeline(url: str, count: int = 3, engine: str = "auto", output_dir: Path = OUTPUT_DIR,
+                 dry_run: bool = False, min_duration: float = DEFAULT_MIN_DURATION,
+                 max_duration: float = DEFAULT_MAX_DURATION, keep_source: bool = False) -> List[dict]:
+    console.print("\n[bold cyan]🎬 VIRALREEL AI — YT → unedited 9:16 clips + titles, captions & SRT[/bold cyan]\n")
+
     try:
         video_id = extract_video_id(url)
     except Exception as e:
-        console.print(f"[bold red]Invalid URL:[/bold red] {e}")
-        sys.exit(1)
+        console.print(f"[bold red]✗ Invalid YouTube URL:[/] {e}")
+        return []
 
-    with console.status("[bold green]Fetching video metadata & transcript...", spinner="dots"):
+    with console.status("[bold green]Fetching video metadata...", spinner="dots"):
         try:
             info = get_video_info(url)
-            title = info.get("title", "Untitled")
-            uploader = info.get("uploader", "Unknown")
-            duration = info.get("duration", 0)
-
-            segments = get_transcript(video_id)
-            formatted_transcript = format_transcript_for_prompt(segments)
         except Exception as e:
-            console.print(f"[bold red]Failed to fetch video information or transcript:[/bold red] {e}")
-            sys.exit(1)
+            console.print(f"[bold red]✗ Could not fetch video info:[/] {e}")
+            return []
 
-    duration_str = format_seconds(duration)
-    info_panel = f"""[bold white]{title}[/bold white]
-[dim]Channel:[/dim] [cyan]{uploader}[/cyan] | [dim]Length:[/dim] [yellow]{duration_str}[/yellow] ({duration}s) | [dim]Transcript Words:[/dim] [green]{sum(len(s.text.split()) for s in segments)}[/green]"""
-    console.print(Panel(info_panel, title="[bold]Video Details[/bold]", border_style="cyan"))
+    duration = info.get("duration", 0)
+    console.print(Panel(
+        f"[bold]{info.get('title', 'Untitled')}[/]\n"
+        f"Channel: {info.get('uploader', 'Unknown')} | Length: {format_seconds(duration)} | ID: {video_id}",
+        title="Video Found", border_style="blue",
+    ))
 
-    # 3. Analyze for Viral Moments
-    with console.status(f"[bold magenta]Analyzing viral potential using AI ({args.engine})...", spinner="bouncingBar"):
+    with console.status("[bold green]Downloading captions / transcript...", spinner="dots"):
+        try:
+            segments = get_transcript(video_id)
+        except Exception as e:
+            console.print(f"[bold red]✗ {e}[/]")
+            return []
+    console.print(f"[dim]Transcript: {len(segments)} segments.[/dim]")
+
+    with Progress(SpinnerColumn(), TextColumn("[bold blue]{task.description}"), console=console) as progress:
+        task = progress.add_task("AI scanning for hooks & best parts...", total=None)
+        cb = lambda msg: progress.update(task, description=msg)
         try:
             analysis = detect_viral_moments(
-                title=title,
-                uploader=uploader,
-                duration=duration,
-                formatted_transcript=formatted_transcript,
-                count=args.count,
-                min_duration=args.min_duration,
-                max_duration=args.max_duration,
-                engine=args.engine,
+                title=info.get("title", "Untitled"), uploader=info.get("uploader", "Unknown"),
+                duration=duration, segments=segments, count=count, min_duration=min_duration,
+                max_duration=max_duration, engine=engine, progress_cb=cb,
             )
         except Exception as e:
-            console.print(f"[bold red]AI Analysis failed:[/bold red] {e}")
-            sys.exit(1)
+            console.print(f"[bold red]✗ AI analysis failed:[/] {e}")
+            return []
 
-    if not analysis.viral_moments:
-        console.print("[bold red]No viral moments detected within duration constraints.[/bold red]")
+    moments = analysis.viral_moments
+    console.print(f"\n[bold yellow]✨ {len(moments)} clips selected ({min_duration:.0f}-{max_duration:.0f}s each)[/bold yellow]\n")
+
+    batch_dir = Path(output_dir) / f"{video_id}_clips"
+    if dry_run:
+        for i, m in enumerate(moments, start=1):
+            console.print(Panel.fit(
+                f"[bold]{m.title}[/]\n{m.caption}\n[dim]{m.timeline} · {m.duration:.0f}s · 🔥{m.viral_score}[/dim]",
+                title=f"Dry run · Reel {i}", border_style="cyan"))
+        return []
+
+    delivered = deliver_clips(url, moments, segments, batch_dir, keep_source=keep_source)
+    if delivered:
+        print_package(delivered, batch_dir)
+    return delivered
+
+
+def main():
+    parser = argparse.ArgumentParser(description="YouTube → unedited 9:16 clips with title, caption, timeline & SRT")
+    parser.add_argument("-u", "--url", type=str, help="YouTube video URL")
+    parser.add_argument("-c", "--count", type=int, default=3, help="Number of clips to deliver (1-10)")
+    parser.add_argument("-e", "--engine", choices=["auto", "gemini", "anthropic"], default="auto")
+    parser.add_argument("-o", "--output-dir", type=Path, default=OUTPUT_DIR)
+    parser.add_argument("--dry-run", action="store_true", help="Analyze only, do not download/cut")
+    parser.add_argument("--min-duration", type=float, default=DEFAULT_MIN_DURATION, help="Min clip length in seconds")
+    parser.add_argument("--max-duration", type=float, default=DEFAULT_MAX_DURATION, help="Max clip length in seconds")
+    parser.add_argument("--keep-source", action="store_true", help="Keep the downloaded source video")
+    args = parser.parse_args()
+
+    url = args.url
+    if not url:
+        url = console.input("[bold cyan]Paste your YouTube video link: [/]").strip()
+    if not url:
+        console.print("[bold red]Error: No YouTube URL provided![/]")
+        sys.exit(1)
+
+    try:
+        count = args.count if args.count else int(console.input("[bold cyan]How many clips? (1-10) [/]").strip() or "3")
+    except ValueError:
+        count = 3
+    count = max(1, min(count, 10))
+
+    try:
+        min_dur = args.min_duration
+        max_dur = args.max_duration
+        if min_dur > max_dur:
+            console.print("[yellow]Min > Max — swapping them.[/yellow]")
+            min_dur, max_dur = max_dur, min_dur
+        run_pipeline(url=url, count=count, engine=args.engine, output_dir=args.output_dir,
+                     dry_run=args.dry_run, min_duration=min_dur, max_duration=max_dur,
+                     keep_source=args.keep_source)
+    except KeyboardInterrupt:
+        console.print("\n[bold yellow]Cancelled by user.[/]")
         sys.exit(0)
+    except Exception as exc:
+        console.print(f"\n[bold red]✗ Pipeline crashed:[/] {exc}")
+        sys.exit(1)
 
-    # 4. Display Analysis Table
-    table = Table(title="[bold yellow]🔥 Detected Viral Moments[/bold yellow]", border_style="yellow")
-    table.add_column("#", style="dim", width=4)
-    table.add_column("Score", style="bold magenta", width=7)
-    table.add_column("Timestamps", style="cyan", width=14)
-    table.add_column("Duration", style="yellow", width=10)
-    table.add_column("Hook / Title", style="bold white")
-    table.add_column("Viral Reason", style="dim")
-
-    for i, m in enumerate(analysis.viral_moments, start=1):
-        time_range = f"{format_seconds(m.start_time)} - {format_seconds(m.end_time)}"
-        dur_text = f"{m.duration:.1f}s"
-        score_badge = f"{m.viral_score}/100"
-        hook_display = f"[bold]{m.hook}[/bold]\n[dim]{m.title}[/dim]"
-        table.add_row(str(i), score_badge, time_range, dur_text, hook_display, m.reason[:80] + "...")
-
-    console.print(table)
-
-    if args.dry_run:
-        console.print("\n[bold green]--dry-run enabled.[/bold green] Analysis complete without rendering videos.")
-        return
-
-    # 5. Download Source Video
-    source_video_path = TEMP_DIR / f"{video_id}.mp4"
-    if not source_video_path.exists():
-        console.print("\n[bold blue]Downloading source video (up to 1080p)...[/bold blue]")
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            TimeRemainingColumn(),
-            console=console
-        ) as progress:
-            task = progress.add_task("Downloading...", total=None)
-            try:
-                download_video(url, source_video_path)
-                progress.update(task, completed=100, description="[bold green]Download Complete![/bold green]")
-            except Exception as e:
-                console.print(f"[bold red]Video download failed:[/bold red] {e}")
-                sys.exit(1)
-    else:
-        console.print(f"\n[dim]Using cached source video: {source_video_path.name}[/dim]")
-
-    # 6. Render Vertical Reels
-    console.print(f"\n[bold green]🎬 Rendering {len(analysis.viral_moments)} Vertical 9:16 Reels...[/bold green]")
-    rendered_files = []
-
-    for idx, m in enumerate(analysis.viral_moments, start=1):
-        clean_title = sanitize_filename(m.title)
-        out_name = f"reel_{idx}_score{m.viral_score}_{clean_title}.mp4"
-        out_file = output_path / out_name
-
-        with console.status(f"[bold cyan]Rendering Reel #{idx}: {m.hook} ({m.duration:.1f}s)...", spinner="dots"):
-            try:
-                render_reel(
-                    source_video_path=source_video_path,
-                    moment=m,
-                    output_file=out_file,
-                    all_segments=segments,
-                    with_subtitles=args.with_subtitles,
-                    with_hook_banner=args.with_banner,
-                )
-                rendered_files.append((out_file, m))
-                console.print(f"  [bold green]✓[/bold green] Reel #{idx} created: [cyan]{out_file.name}[/cyan] ({m.duration:.1f}s)")
-            except Exception as e:
-                console.print(f"  [bold red]✗[/bold red] Failed to render Reel #{idx}: {e}")
-
-    # 7. Summary
-    if rendered_files:
-        summary_panel = f"[bold green]Successfully generated {len(rendered_files)} Reels![/bold green]\n\n"
-        for f, m in rendered_files:
-            summary_panel += f"• [bold white]{f.name}[/bold white]\n"
-            summary_panel += f"  Location: [blue]{f.resolve()}[/blue]\n"
-            summary_panel += f"  Hook: [yellow]{m.hook}[/yellow] (Score: {m.viral_score})\n\n"
-        console.print(Panel(summary_panel, title="[bold]Export Complete[/bold]", border_style="green"))
 
 if __name__ == "__main__":
     main()
