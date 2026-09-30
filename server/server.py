@@ -240,6 +240,13 @@ def _ensure_source(url: str, video_id: str, job_id: str) -> Path:
 
 
 def _ensure_segments(video_id: str) -> List[TranscriptSegment]:
+    cache = TEMP_DIR / f"{video_id}_transcript.json"
+    if cache.exists():
+        try:
+            raw = json.loads(cache.read_text(encoding="utf-8"))
+            return [TranscriptSegment(**r) for r in raw]
+        except Exception:
+            pass
     try:
         return get_transcript(video_id)
     except Exception:
@@ -302,6 +309,13 @@ def _run_cut(job_id: str, req: CutRequest):
                 continue
 
             srt_path = None
+            # cache transcript on disk so future batches never re-fetch it
+            if segments:
+                try:
+                    cache = TEMP_DIR / f"{video_id}_transcript.json"
+                    cache.write_text(json.dumps([seg.model_dump() for seg in segments]), encoding="utf-8")
+                except Exception:
+                    pass
             if segments:
                 srt_path = clip_dir / f"{stem}.srt"
                 try:
