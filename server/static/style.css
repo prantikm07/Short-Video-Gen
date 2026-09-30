@@ -1484,6 +1484,11 @@ body {
   color: var(--accent-cyan, #67E8F9);
   text-decoration: underline;
   white-space: nowrap;
+  background: transparent;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+  font-family: inherit;
 }
 
 .render-btn.done {

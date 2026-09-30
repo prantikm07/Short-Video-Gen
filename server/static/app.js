@@ -3,12 +3,28 @@
 // Flow: paste link -> pick reel count + min/max seconds
 //       -> AI detects best moments (background job polling)
 //       -> cut unedited 9:16 clips + .srt + title + caption
+// All downloads go through /api/download/* so the browser
+// always saves the file instead of opening it in a tab.
 // ===================================================
 
 let currentVideoInfo = null;
 let currentMoments = [];
 let loadingInterval = null;
 let currentModalReel = null;
+
+function dlClipUrl(url, filename) {
+  return `/api/download/clip?url=${encodeURIComponent(url)}&name=${encodeURIComponent(filename || "")}`;
+}
+
+function downloadViaApi(url, filename) {
+  const a = document.createElement("a");
+  a.href = dlClipUrl(url, filename);
+  a.download = filename || url.split("/").pop();
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+}
+window.downloadViaApi = downloadViaApi;
 
 document.addEventListener("DOMContentLoaded", () => {
   checkApiStatus();
@@ -393,8 +409,8 @@ function renderResults(result) {
       <span class="result-timeline">\u23f1 ${escapeHtml(c.timeline)}</span>
       <span class="result-title" title="${escapeHtml(c.title)}">${escapeHtml(c.title)}</span>
       <span class="result-size">${c.size_mb || "?"} MB</span>
-      <a class="tiny-link" href="${c.url}" download>mp4</a>
-      ${c.srt_url ? `<a class="tiny-link" href="${c.srt_url}" download>srt</a>` : ""}
+      <button type="button" class="tiny-link" onclick="downloadViaApi('${c.url}')">\u2b07 mp4</button>
+      ${c.srt_url ? `<button type="button" class="tiny-link" onclick="downloadViaApi('${c.srt_url}')">\u2b07 srt</button>` : ""}
     `;
     const preview = document.createElement("button");
     preview.className = "secondary-btn tiny-btn";
@@ -455,7 +471,7 @@ async function loadBatches() {
           <div class="gallery-card-title" title="${escapeHtml(b.batch_id)}">${escapeHtml(b.batch_id)}</div>
           <div class="gallery-card-meta"><span>ZIP package</span><span>9:16 Vertical</span></div>
           <div class="gallery-actions">
-            <a class="download-reel-btn" href="${b.zip_url}" download="${b.zip_name}">\u2b07 Save ZIP</a>
+            <button type="button" class="download-reel-btn" onclick="window.location.href='${b.zip_url}'">\u2b07 Save ZIP</button>
           </div>`;
       } else {
         const first = (b.clips || []).find(c => c.url);
@@ -471,7 +487,7 @@ async function loadBatches() {
           </div>
           <div class="gallery-actions">
             ${first ? `<button type="button" class="preview-reel-btn" onclick='openBatchFirst(${JSON.stringify(first.url)})'>\u25b6 Preview</button>` : ""}
-            <a class="download-reel-btn" href="/clips/${encodeURIComponent(b.batch_id)}_clips.zip" download>\u2b07 Save ZIP</a>
+            <button type="button" class="download-reel-btn" onclick="window.location.href='/api/download/${encodeURIComponent(b.batch_id)}'">\u2b07 Download All (ZIP)</button>
           </div>`;
       }
       grid.appendChild(card);
@@ -506,18 +522,18 @@ function openClipModal(clip) {
   document.getElementById("modal-timeline-badge").textContent = clip.timeline ? `\u23f1 ${clip.timeline}` : "";
 
   const dl = document.getElementById("modal-download-btn");
-  dl.href = clip.url;
-  dl.download = clip.url.split("/").pop();
+  dl.onclick = (e) => { e.preventDefault(); downloadViaApi(clip.url); };
 
   const srtBtn = document.getElementById("modal-srt-btn");
-  if (clip.srt_text) {
-    const blob = new Blob([clip.srt_text], { type: "text/plain;charset=utf-8" });
-    srtBtn.href = URL.createObjectURL(blob);
-    srtBtn.download = (clip.url.split("/").pop() || "clip.mp4").replace(/\.mp4$/i, "") + ".srt";
+  const srtName = (clip.url.split("/").pop() || "clip.mp4").replace(/\.mp4$/i, "") + ".srt";
+  if (clip.srt_url || (clip.files && clip.files.srt)) {
+    const srtUrl = clip.srt_url || clip.url.replace(/[^/]+$/, encodeURIComponent(clip.files.srt));
+    srtBtn.onclick = (e) => { e.preventDefault(); downloadViaApi(srtUrl, clip.files ? clip.files.srt : srtName); };
     srtBtn.style.display = "";
-  } else if (clip.files && clip.files.srt) {
-    srtBtn.href = clip.url.replace(/[^/]+$/, encodeURIComponent(clip.files.srt));
-    srtBtn.download = clip.files.srt;
+  } else if (clip.srt_text) {
+    const blob = new Blob([clip.srt_text], { type: "text/plain;charset=utf-8" });
+    srtBtn.onclick = (e) => { e.preventDefault(); window.location.href = URL.createObjectURL(blob); };
+    srtBtn.download = srtName;
     srtBtn.style.display = "";
   } else {
     srtBtn.style.display = "none";
