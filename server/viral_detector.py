@@ -59,8 +59,16 @@ Reply with compact JSON only, no prose, no markdown:
 {{"c":[[start_sec,end_sec,score]]}}
 score = viral potential 1-100. Example: {{"c":[[742.0,795.5,88],[810.0,860.0,71]]}}"""
 
-PACKAGE_SYSTEM = """You are a viral short-form producer and copywriter.
-You get the exact spoken text of a few already-selected clips.
+PACKAGE_SYSTEM = """You are a top-tier short-form copywriter (MrBeast / Hormozi style hooks).
+You get the exact spoken text of already-selected clips from a real video.
+Write titles and captions that make people STOP SCROLLING.
+
+Hard rules:
+- NO clickbait lies, NO generic phrases ("game-changer", "must watch", "mind-blowing", "you won't believe", "this will change your life"), NO ALL CAPS shouting, NO emoji in titles.
+- The title must come from something ACTUALLY SAID in the clip - a specific number, claim, confession, fight, reveal or contrarian take. Specificity beats hype.
+- Good title patterns: open loop ("Why he ..."), surprising concrete fact ("...only 3% of people know this"), conflict ("He called X a scam - then said this"), bold quote fragment.
+- Title: max 12 words / 70 chars, sentence case, curiosity gap WITHOUT being vague.
+- Caption: one punchy line tied to THIS clip's content (not a template), then 4-6 relevant hashtags including #Shorts.
 For EACH clip return the finished posting package. Echo the clip ids back unchanged."""
 
 PACKAGE_USER = """Source video: {title} ({uploader})
@@ -70,8 +78,6 @@ Clips (id, time range in seconds, spoken text):
 
 Return JSON only:
 {{"moments":[{{"id":0,"title":"...","caption":"..."}}]}}
-- title: hooking headline, max 12 words / 70 chars, curiosity gap, no lies.
-- caption: ready-to-post social caption = 1 punchy line + 4-6 relevant hashtags.
 Include ALL {count} ids exactly once, no extra keys."""
 
 
@@ -297,8 +303,8 @@ def _package(selected: List[ViralMoment], compacted: List[TranscriptSegment], me
             seed = re.sub(r"^\[[\d.]+\]\s*", "", head.split("\n")[0]) if head else ""
             m.title = (seed[:65].rstrip() or "Best moment of the video")
         if not m.caption:
-            m.caption = (f"{m.title}\n\nWait for it 👀 Full video on the channel.\n\n"
-                         f"#Shorts #Reels #Viral #FYP #{re.sub(r'[^A-Za-z]', '', meta['title'].split()[0][:12]) or 'Clip'}")
+            topic_tag = "#" + (re.sub(r"[^A-Za-z]", "", meta["title"].split()[0][:12]) or "Clip")
+            m.caption = f"{m.title}\n\n{topic_tag} #Shorts #Reels #Viral #FYP"
 
 
 # ---------------------------------------------------------------------------

@@ -6,10 +6,11 @@ from typing import Optional, List
 import json
 import shutil
 import threading
+from urllib.parse import unquote
 import zipfile
 from typing import Any, Dict
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, RedirectResponse, JSONResponse
 from pydantic import BaseModel, Field
@@ -239,6 +240,13 @@ def _ensure_source(url: str, video_id: str, job_id: str) -> Path:
 
 
 def _ensure_segments(video_id: str) -> List[TranscriptSegment]:
+    cache = TEMP_DIR / f"{video_id}_transcript.json"
+    if cache.exists():
+        try:
+            raw = json.loads(cache.read_text(encoding="utf-8"))
+            return [TranscriptSegment(**r) for r in raw]
+        except Exception:
+            pass
     try:
         return get_transcript(video_id)
     except Exception:
@@ -301,6 +309,13 @@ def _run_cut(job_id: str, req: CutRequest):
                 continue
 
             srt_path = None
+            # cache transcript on disk so future batches never re-fetch it
+            if segments:
+                try:
+                    cache = TEMP_DIR / f"{video_id}_transcript.json"
+                    cache.write_text(json.dumps([seg.model_dump() for seg in segments]), encoding="utf-8")
+                except Exception:
+                    pass
             if segments:
                 srt_path = clip_dir / f"{stem}.srt"
                 try:
@@ -329,16 +344,22 @@ def _run_cut(job_id: str, req: CutRequest):
 
         jobs.update(job_id, message="Packaging downloads...", percent=95)
         zip_name = f"{batch_id}_clips.zip"
+        # Fresh ZIP per batch (rebuilt on every cut so it always contains the latest clips)
         zip_path = CLIPS_DIR / zip_name
+        if zip_path.exists():
+            try:
+                zip_path.unlink()
+            except Exception:
+                pass
+        zip_url = None
         try:
             with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_STORED) as zf:
                 for f in sorted(clip_dir.iterdir()):
                     if f.is_file() and f.name != "manifest.json":
                         zf.write(f, arcname=f"{batch_id}/{f.name}")
-            zip_url = f"/clips/{zip_name}"
+            zip_url = f"/api/download/{batch_id}"
         except Exception as e:
             print(f"[warn] zip creation failed: {e}")
-            zip_url = None
 
         jobs.finish(job_id, {"manifest": manifest, "zip_url": zip_url, "zip_name": zip_name if zip_url else None})
     except Exception as e:
@@ -377,6 +398,57 @@ def get_batch(batch_id: str):
     if not manifest.exists():
         raise HTTPException(status_code=404, detail="Batch not found.")
     return json.loads(manifest.read_text(encoding="utf-8"))
+
+
+def _safe_batch_dir(batch_id: str) -> Path:
+    safe = re.sub(r"[^\w-]", "", batch_id or "")
+    d = CLIPS_DIR / safe
+    if not safe or not d.is_dir():
+        raise HTTPException(status_code=404, detail="Batch not found.")
+    return d
+
+
+@app.get("/api/download/clip")
+def download_single_clip(
+    url: str = Query(..., description="Server-relative clip url, e.g. /clips/batch/file.mp4"),
+    name: str = Query("", description="Optional download filename override"),
+):
+    """Force-download one file from the clips folder (proper Content-Disposition)."""
+    raw = url.split("?")[0].split("/")[-1]
+    decoded = unquote(raw)
+    candidates = list(CLIPS_DIR.rglob(decoded))
+    if not candidates:
+        safe = re.sub(r"[^\w.\-]", "_", raw)
+        candidates = list(CLIPS_DIR.rglob(safe))
+    if not candidates:
+        raise HTTPException(status_code=404, detail="File not found on server.")
+    path = candidates[0]
+    suffix = path.suffix.lower()
+    media = {".mp4": "video/mp4"}.get(suffix) or (
+        "text/plain; charset=utf-8" if suffix in (".srt", ".txt") else "application/octet-stream"
+    )
+    filename = re.sub(r"[^\w.\- ]", "", name).strip() or path.name
+    return FileResponse(str(path), media_type=media, filename=filename)
+
+
+@app.get("/api/download/{batch_id}")
+def download_batch_zip(batch_id: str):
+    """Download ALL assets of a batch as one ZIP (rebuilt on the fly if missing/stale)."""
+    clip_dir = _safe_batch_dir(batch_id)
+    zip_path = CLIPS_DIR / f"{clip_dir.name}_clips.zip"
+    newest_asset = max((f.stat().st_mtime for f in clip_dir.iterdir() if f.is_file()), default=0)
+    if not zip_path.exists() or zip_path.stat().st_mtime < newest_asset:
+        try:
+            with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_STORED) as zf:
+                for f in sorted(clip_dir.iterdir()):
+                    if f.is_file() and f.name != "manifest.json":
+                        zf.write(f, arcname=f"{clip_dir.name}/{f.name}")
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"ZIP packaging failed: {e}")
+    if not zip_path.exists() or zip_path.stat().st_size == 0:
+        raise HTTPException(status_code=404, detail="No files to download in this batch yet.")
+    return FileResponse(str(zip_path), media_type="application/zip",
+                        filename=f"{clip_dir.name}_clips.zip")
 
 
 @app.get("/api/subtitles/{video_id}")

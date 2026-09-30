@@ -325,7 +325,7 @@ def cut_clip_916(
     Fast path: if the source is already <=1080 wide and <=1920 tall (i.e. a true
     vertical video) the stream is copied with NO re-encode at all, so quality is
     bit-for-bit identical to the source. Otherwise a high-quality single re-encode
-    (crf 17, slow preset) keeps the result crisp.
+    (crf 18, medium preset) keeps the result crisp.
     """
     output_file.parent.mkdir(parents=True, exist_ok=True)
     duration = end_time - start_time
@@ -364,7 +364,7 @@ def cut_clip_916(
             )
             cmd = base + [
                 "-vf", vf,
-                "-c:v", "libx264", "-preset", "slow", "-crf", "17",
+                "-c:v", "libx264", "-preset", "medium", "-crf", "18",
                 "-c:a", "aac", "-b:a", "192k",
                 "-pix_fmt", "yuv420p",
                 "-movflags", "+faststart",
@@ -373,7 +373,10 @@ def cut_clip_916(
         process = subprocess.run(cmd, capture_output=True, text=True)
         ok = process.returncode == 0 and temp_render_path.exists() and temp_render_path.stat().st_size > 50_000
         if not ok and not already_vertical_fit:
-            raise RuntimeError(f"FFmpeg cut failed:\n{process.stderr[-1200:]}")
+            raise RuntimeError(
+                f"FFmpeg cut failed (exit {process.returncode}): "
+                f"{(process.stderr or '').strip().splitlines()[-3:]}"
+            )
 
         if not ok:
             # stream copy produced junk (rare codec mismatch) -> fall back to re-encode
@@ -383,14 +386,17 @@ def cut_clip_916(
             )
             cmd = base + [
                 "-vf", vf,
-                "-c:v", "libx264", "-preset", "slow", "-crf", "17",
+                "-c:v", "libx264", "-preset", "medium", "-crf", "18",
                 "-c:a", "aac", "-b:a", "192k",
                 "-pix_fmt", "yuv420p", "-movflags", "+faststart",
                 str(temp_render_path),
             ]
             process = subprocess.run(cmd, capture_output=True, text=True)
             if process.returncode != 0 or not temp_render_path.exists():
-                raise RuntimeError(f"FFmpeg cut failed:\n{process.stderr[-1200:]}")
+                raise RuntimeError(
+                f"FFmpeg cut failed (exit {process.returncode}): "
+                f"{(process.stderr or '').strip().splitlines()[-3:]}"
+            )
 
         temp_render_path.replace(output_file)
         return output_file
