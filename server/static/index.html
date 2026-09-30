@@ -18,7 +18,7 @@
   <link rel="apple-touch-icon" sizes="180x180" href="/static/apple-touch-icon.png?v=1">
   
   <!-- Vanilla CSS Stylesheet with cache busting -->
-  <link rel="stylesheet" href="/static/style.css?v=20260927_3">
+  <link rel="stylesheet" href="/static/style.css?v=20260930_1">
 </head>
 <body>
   <!-- Ambient background lighting effects -->
@@ -65,7 +65,7 @@
         <span class="sparkle-icon">✨</span> AI Virality Detection Engine
       </div>
       <h2 class="hero-title">Turn Any YouTube Video Into <span class="gradient-text">Viral 9:16 Reels</span></h2>
-      <p class="hero-desc">Extract high-curiosity 3-second hooks, perfect retention pacing, and auto-render 9:16 vertical clips with TikTok subtitles.</p>
+      <p class="hero-desc">AI detects the best moments and delivers, per reel: a hooking title, a ready-to-post caption, the exact timeline, an .srt subtitle file and the raw unedited clip in 9:16 high quality. You do the editing.</p>
 
       <form id="analyze-form" class="url-input-form" onsubmit="event.preventDefault(); handleAnalyze();">
         <div class="input-wrapper">
@@ -99,43 +99,39 @@
           </div>
 
           <div class="control-group">
-            <label for="clips-count-select" class="control-label">Viral Clips</label>
+            <label for="clips-count-select" class="control-label">Reels</label>
             <select id="clips-count-select" class="control-select">
-              <option value="1">Top 1 Reel</option>
-              <option value="2">Top 2 Reels</option>
-              <option value="3" selected>Top 3 Reels</option>
-              <option value="5">Top 5 Reels</option>
+              <option value="1">1 Reel</option>
+              <option value="2">2 Reels</option>
+              <option value="3" selected>3 Reels</option>
+              <option value="4">4 Reels</option>
+              <option value="5">5 Reels</option>
+              <option value="6">6 Reels</option>
+              <option value="7">7 Reels</option>
+              <option value="8">8 Reels</option>
+              <option value="9">9 Reels</option>
+              <option value="10">10 Reels</option>
             </select>
           </div>
 
           <div class="control-group">
             <label for="min-duration-input" class="control-label">Min (s)</label>
-            <input type="number" id="min-duration-input" class="control-input-number" value="20" min="10" max="60" />
+            <input type="number" id="min-duration-input" class="control-input-number" value="20" min="10" max="600" />
           </div>
 
           <div class="control-group">
             <label for="max-duration-input" class="control-label">Max (s)</label>
-            <input type="number" id="max-duration-input" class="control-input-number" value="60" min="20" max="90" />
+            <input type="number" id="max-duration-input" class="control-input-number" value="60" min="15" max="600" />
           </div>
 
           <div class="control-toggles">
-            <span class="max-res-badge" title="Always rendered in maximum source resolution">💎 Max Res</span>
-            <label class="toggle-container" title="Burn external subtitles into video">
-              <input type="checkbox" id="subtitles-toggle" />
-              <span class="toggle-slider"></span>
-              <span class="toggle-text">Subtitles</span>
-            </label>
-            <label class="toggle-container" title="Add top hook banner headline">
-              <input type="checkbox" id="banner-toggle" />
-              <span class="toggle-slider"></span>
-              <span class="toggle-text">Hook Banner</span>
-            </label>
+            <span class="max-res-badge" title="Clips are cut from the highest quality download, never re-edited">💎 Max Res · Unedited</span>
           </div>
         </div>
 
         <button type="submit" id="analyze-btn" class="primary-btn">
           <span class="btn-icon">⚡</span>
-          <span class="btn-text">Detect Viral Moments</span>
+          <span class="btn-text">Detect Best Moments</span>
         </button>
       </form>
     </section>
@@ -146,9 +142,9 @@
         <div class="cyber-spinner"></div>
       </div>
       <h3 id="loading-title" class="loading-title">Analyzing Virality Patterns...</h3>
-      <p id="loading-desc" class="loading-desc">Fetching transcript and running retention curve analysis with Gemini 3.8 Flash.</p>
+      <p id="loading-desc" class="loading-desc">Fetching transcript and scanning for the best standalone moments.</p>
       <div class="progress-bar-container">
-        <div id="progress-bar-fill" class="progress-bar-fill"></div>
+        <div id="progress-bar-fill" class="progress-bar-fill" style="width:0%"></div>
       </div>
     </section>
 
@@ -172,12 +168,21 @@
     <section id="moments-section" class="moments-section hidden" aria-label="Detected Viral Moments">
       <div class="section-header">
         <div>
-          <h2 class="section-title">🔥 Ranked Viral Moments</h2>
-          <p class="section-subtitle">Ranked by algorithmic retention, curiosity hooks, and standalone value.</p>
+          <h2 class="section-title">🔥 Ranked Best Moments</h2>
+          <p class="section-subtitle">Each reel delivers: hooking title · post caption · timeline · .srt subtitles · unedited 9:16 clip.</p>
         </div>
-        <button id="render-all-btn" class="secondary-btn" onclick="handleRenderAll()">
-          🎬 Render All Reels
+        <button id="render-all-btn" class="secondary-btn" onclick="handleCutAll()">
+          ✂️ Cut All Reels (9:16)
         </button>
+      </div>
+
+      <div id="cut-progress" class="loading-section glass-panel hidden" aria-live="polite" style="margin-bottom:1.5rem;">
+        <div class="spinner-wrapper"><div class="cyber-spinner"></div></div>
+        <h3 id="cut-loading-title" class="loading-title">Cutting clips...</h3>
+        <p id="cut-loading-desc" class="loading-desc">Downloading source video at max quality.</p>
+        <div class="progress-bar-container">
+          <div id="cut-progress-bar-fill" class="progress-bar-fill" style="width:0%"></div>
+        </div>
       </div>
 
       <div id="moments-grid" class="moments-grid">
@@ -185,23 +190,23 @@
       </div>
     </section>
 
-    <!-- Previously Generated Reels Gallery -->
-    <section id="gallery-section" class="gallery-section glass-panel" aria-label="Generated Reels Gallery">
+    <!-- Generated Clip Packages -->
+    <section id="gallery-section" class="gallery-section glass-panel" aria-label="Generated Reels Library">
       <div class="gallery-header">
         <div>
-          <h2 class="section-title">📂 Generated Reels Library</h2>
-          <p class="section-subtitle">Browse and download your ready-to-post 9:16 vertical videos.</p>
+          <h2 class="section-title">📂 Clip Packages</h2>
+          <p class="section-subtitle">Finished batches: unedited 9:16 mp4 + .srt + title + caption per reel, plus a ZIP of everything.</p>
         </div>
-        <button id="refresh-gallery-btn" class="icon-refresh-btn" title="Refresh library" onclick="loadReelsGallery()">
+        <button id="refresh-gallery-btn" class="icon-refresh-btn" title="Refresh library" onclick="loadBatches()">
           🔄 Refresh
         </button>
       </div>
 
       <div id="gallery-grid" class="gallery-grid">
-        <!-- Rendered Reels Injected Here -->
+        <!-- Batch cards injected here -->
       </div>
       <div id="gallery-empty" class="gallery-empty">
-        <p>No reels generated yet. Paste a YouTube link above to create your first reel!</p>
+        <p>No clip packages yet. Paste a YouTube link above to detect the best moments!</p>
       </div>
     </section>
 
@@ -217,62 +222,34 @@
         <div class="player-wrapper">
           <video id="modal-video-player" class="reel-player" controls autoplay playsinline loop></video>
         </div>
-        <!-- Reel Details & Actions -->
+        <!-- Clip Details & Actions -->
         <div class="modal-sidebar">
           <div class="modal-badge">
             <span id="modal-score-badge" class="score-pill">95/100</span>
             <span id="modal-duration-badge" class="meta-pill">35.0s</span>
+            <span id="modal-timeline-badge" class="meta-pill">--:-- - --:--</span>
           </div>
-          <h3 id="modal-reel-title" class="modal-title">Reel Title</h3>
+          <h3 id="modal-reel-title" class="modal-title">Clip Title</h3>
           <div class="hook-preview-box">
-            <span class="hook-label">HOOK TEXT BANNER</span>
-            <p id="modal-hook-text" class="hook-text">"HOOK GOES HERE"</p>
+            <span class="hook-label">CAPTION TO POST</span>
+            <p id="modal-caption-text" class="hook-text">Caption goes here</p>
           </div>
           <div class="action-buttons-group">
             <a id="modal-download-btn" class="primary-btn download-btn" href="#" download>
-              ⬇️ Download 9:16 Reel (.mp4)
+              ⬇️ Download 9:16 Clip (.mp4)
             </a>
-            <button id="modal-upload-toggle-btn" class="youtube-action-btn" onclick="toggleUploadDrawer()">
-              <span class="btn-yt-icon">🔴</span> Upload to YouTube Shorts
+            <button class="secondary-btn" onclick="copyModalTitle()">
+              📋 Copy Title
             </button>
-            <button class="secondary-btn" onclick="copyHookToClipboard()">
-              📋 Copy Hook Headline
+            <button class="secondary-btn" onclick="copyModalCaption()">
+              📋 Copy Caption
             </button>
-          </div>
-
-          <!-- YouTube Upload Drawer -->
-          <div id="modal-upload-drawer" class="upload-drawer hidden">
-            <div class="drawer-header">
-              <span class="drawer-title">🚀 Post Directly to YouTube Shorts</span>
-            </div>
-            <div class="drawer-field">
-              <div class="field-label-row">
-                <label for="yt-upload-title" class="drawer-label">Short Title</label>
-                <button type="button" class="ai-rewrite-btn" onclick="generateViralCopy()">✨ AI Rewrite</button>
-              </div>
-              <input type="text" id="yt-upload-title" class="drawer-input" placeholder="Catchy title #Shorts" maxlength="100" />
-              <div id="yt-title-suggestions" class="title-suggestions-container hidden"></div>
-            </div>
-            <div class="drawer-field">
-              <div class="field-label-row">
-                <label for="yt-upload-desc" class="drawer-label">Description & Hashtags</label>
-              </div>
-              <textarea id="yt-upload-desc" class="drawer-textarea" rows="4" placeholder="Engaging description with #Shorts"></textarea>
-            </div>
-            <div class="drawer-controls-row">
-              <div class="drawer-field flex-1">
-                <label for="yt-upload-privacy" class="drawer-label">Visibility</label>
-                <select id="yt-upload-privacy" class="drawer-select">
-                  <option value="public" selected>Public (Instant Release)</option>
-                  <option value="unlisted">Unlisted (Anyone with link)</option>
-                  <option value="private">Private (Only You)</option>
-                </select>
-              </div>
-              <button id="yt-confirm-upload-btn" class="yt-upload-submit-btn" onclick="executeYouTubeUpload()">
-                🚀 Publish Short
-              </button>
-            </div>
-            <div id="yt-upload-status" class="upload-status-box hidden"></div>
+            <a id="modal-srt-btn" class="secondary-btn" href="#" download style="text-align:center;">
+              💬 Download Subtitles (.srt)
+            </a>
+            <button class="secondary-btn" onclick="copyModalSrt()">
+              📋 Copy SRT Text
+            </button>
           </div>
         </div>
       </div>
@@ -332,6 +309,6 @@
   <div id="toast-container" class="toast-container" aria-live="polite"></div>
 
   <!-- JavaScript Application Logic with cache busting -->
-  <script src="/static/app.js?v=20260927_3"></script>
+  <script src="/static/app.js?v=20260930_1"></script>
 </body>
 </html>

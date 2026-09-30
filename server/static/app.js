@@ -1,88 +1,83 @@
 // ===================================================
 // VIRALREEL AI — CLIENT-SIDE JAVASCRIPT
+// Flow: paste link -> pick reel count + min/max seconds
+//       -> AI detects best moments (background job polling)
+//       -> cut unedited 9:16 clips + .srt + title + caption
 // ===================================================
 
 let currentVideoInfo = null;
 let currentMoments = [];
 let loadingInterval = null;
-
 let currentModalReel = null;
 
-// Initialize when DOM is ready
 document.addEventListener("DOMContentLoaded", () => {
   checkApiStatus();
-  checkYouTubeStatus();
-  loadReelsGallery();
 
-  // Escape key closes open modals
   document.addEventListener("keydown", (e) => {
-    if (e.key === "Escape") {
-      closeVideoModal();
-      closeYouTubeSetupModal();
-    }
+    if (e.key === "Escape") closeVideoModal();
   });
 
-  // Handle redirect from Google OAuth
-  const urlParams = new URLSearchParams(window.location.search);
-  if (urlParams.get("youtube") === "connected") {
-    showToast("🎉 YouTube Studio linked successfully!");
-    window.history.replaceState({}, document.title, window.location.pathname);
-  } else if (urlParams.get("youtube") === "error") {
-    showToast(`OAuth Error: ${urlParams.get("detail") || "Authorization failed"}`, "error");
-    window.history.replaceState({}, document.title, window.location.pathname);
-  }
+  loadBatches();
 });
 
 // Toast notification helper
 function showToast(message, type = "success") {
   const container = document.getElementById("toast-container");
+  if (!container) return;
   const toast = document.createElement("div");
   toast.className = `toast toast-${type}`;
-  toast.innerHTML = `<span>${type === "success" ? "✓" : "⚠️"}</span> <span>${message}</span>`;
+  toast.innerHTML = `<span>${type === "success" ? "\u2713" : "\u26a0\ufe0f"}</span> <span>${message}</span>`;
   container.appendChild(toast);
   setTimeout(() => {
     toast.style.opacity = "0";
     setTimeout(() => toast.remove(), 300);
-  }, 4000);
+  }, 4200);
 }
 
-// Format seconds into mm:ss
 function formatTime(seconds) {
-  const m = Math.floor(seconds / 60);
-  const s = Math.floor(seconds % 60);
-  return `${m}:${s < 10 ? "0" : ""}${s}`;
+  const s = Math.max(0, Math.round(Number(seconds) || 0));
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = s % 60;
+  return `${h ? h + ":" : ""}${String(m).padStart(h ? 2 : 1, "0")}:${sec < 10 ? "0" : ""}${sec}`;
 }
 
-// 1. Check API Key Status
+function escapeHtml(str) {
+  if (str === null || str === undefined) return "";
+  return String(str).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+async function copyText(text, label) {
+  try {
+    await navigator.clipboard.writeText(text || "");
+    showToast(`${label} copied to clipboard!`);
+  } catch (err) {
+    showToast("Clipboard access denied by the browser.", "error");
+  }
+}
+
+// 1. Check API key status
 async function checkApiStatus() {
   try {
     const res = await fetch("/api/status");
     const data = await res.json();
-
-    const geminiBadge = document.getElementById("gemini-status-badge");
-    const anthropicBadge = document.getElementById("anthropic-status-badge");
-
-    if (data.gemini_connected) {
-      geminiBadge.classList.add("status-active");
-      geminiBadge.querySelector(".status-dot").style.backgroundColor = "var(--accent-green)";
-    } else {
-      geminiBadge.querySelector(".status-dot").style.backgroundColor = "var(--text-dim)";
-      geminiBadge.title = "GEMINI_API_KEY missing in .env";
-    }
-
-    if (data.anthropic_connected) {
-      anthropicBadge.classList.add("status-active");
-      anthropicBadge.querySelector(".status-dot").style.backgroundColor = "var(--accent-green)";
-    } else {
-      anthropicBadge.querySelector(".status-dot").style.backgroundColor = "var(--text-dim)";
-      anthropicBadge.title = "ANTHROPIC_API_KEY missing in .env";
-    }
+    [["gemini-status-badge", data.gemini_connected], ["anthropic-status-badge", data.anthropic_connected]].forEach(([id, ok]) => {
+      const badge = document.getElementById(id);
+      if (!badge) return;
+      const dot = badge.querySelector(".status-dot");
+      if (ok) {
+        badge.classList.add("status-active");
+        if (dot) dot.style.backgroundColor = "var(--accent-green)";
+      } else if (dot) {
+        dot.style.backgroundColor = "var(--text-dim)";
+      }
+    });
   } catch (err) {
     console.warn("Could not check API status:", err);
   }
 }
 
-// 2. Clipboard Paste Helper
+// 2. Clipboard paste helper
 async function handlePasteClipboard() {
   try {
     const text = await navigator.clipboard.readText();
@@ -95,7 +90,7 @@ async function handlePasteClipboard() {
   }
 }
 
-// 3. Analyze Video & Find Viral Moments
+// 3. Analyze video -> detect the best moments (background job + polling)
 async function handleAnalyze() {
   const url = document.getElementById("youtube-url-input").value.trim();
   if (!url) {
@@ -107,74 +102,64 @@ async function handleAnalyze() {
   const count = parseInt(document.getElementById("clips-count-select").value, 10);
   const minDuration = parseFloat(document.getElementById("min-duration-input").value) || 20;
   const maxDuration = parseFloat(document.getElementById("max-duration-input").value) || 60;
+  if (minDuration > maxDuration) {
+    showToast("Min seconds must be smaller than max seconds.", "error");
+    return;
+  }
 
-  // Show loading UI
   const loadingSection = document.getElementById("loading-section");
   const analyzeBtn = document.getElementById("analyze-btn");
   const momentsSection = document.getElementById("moments-section");
   const overviewSection = document.getElementById("video-overview-section");
+  const progressFill = document.getElementById("progress-bar-fill");
+  const loadingTitle = document.getElementById("loading-title");
+  const loadingDesc = document.getElementById("loading-desc");
 
   loadingSection.classList.remove("hidden");
   momentsSection.classList.add("hidden");
   overviewSection.classList.add("hidden");
   analyzeBtn.disabled = true;
-
-  // Progressive loading steps
-  const loadingMessages = [
-    { title: "Fetching Video & Transcripts...", desc: "Extracting timestamps and high-quality captions from YouTube." },
-    { title: "Analyzing 3-Second Hooks...", desc: "Scanning opening lines for curiosity gaps and pattern interrupts." },
-    { title: "Evaluating Retention Curves...", desc: "Measuring emotional pacing and standalone completeness with Gemini 3.8." },
-    { title: "Ranking Viral Moments...", desc: "Selecting the top scoring segments for 9:16 vertical reels." }
-  ];
-  let msgIndex = 0;
-  const loadingTitle = document.getElementById("loading-title");
-  const loadingDesc = document.getElementById("loading-desc");
-
-  loadingInterval = setInterval(() => {
-    msgIndex = (msgIndex + 1) % loadingMessages.length;
-    loadingTitle.textContent = loadingMessages[msgIndex].title;
-    loadingDesc.textContent = loadingMessages[msgIndex].desc;
-  }, 2600);
-
+  if (progressFill) progressFill.style.width = "3%";
+  loadingTitle.textContent = "Scanning for the best moments...";
+  loadingDesc.textContent = "Fetching video metadata and captions.";
   loadingSection.scrollIntoView({ behavior: "smooth" });
 
   try {
     const res = await fetch("/api/analyze", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        url,
-        count,
-        engine,
-        min_duration: minDuration,
-        max_duration: maxDuration
-      })
+      body: JSON.stringify({ url, count, engine, min_duration: minDuration, max_duration: maxDuration })
     });
-
     const data = await res.json();
-    if (!res.ok) {
-      throw new Error(data.detail || "Virality analysis failed.");
+    if (!res.ok) throw new Error(data.detail || "Virality analysis failed.");
+
+    let result = null;
+    if (data.cached && data.result) {
+      result = data.result;
+    } else {
+      result = await pollJob(data.job_id, (job) => {
+        if (progressFill) progressFill.style.width = `${Math.max(3, job.percent || 0)}%`;
+        if (job.message) loadingDesc.textContent = job.message;
+      });
     }
 
-    currentVideoInfo = data.video_info;
-    currentMoments = data.viral_moments;
+    currentVideoInfo = result.video_info || {};
+    if (!currentVideoInfo.webpage_url) currentVideoInfo.webpage_url = url;
+    if (!currentVideoInfo.id) currentVideoInfo.id = result.video_id;
+    currentMoments = result.viral_moments || [];
 
-    // Render Overview
     document.getElementById("video-thumb").src = currentVideoInfo.thumbnail || "";
-    document.getElementById("video-title").textContent = currentVideoInfo.title;
-    document.getElementById("video-channel").textContent = currentVideoInfo.uploader;
+    document.getElementById("video-title").textContent = currentVideoInfo.title || "Video";
+    document.getElementById("video-channel").textContent = currentVideoInfo.uploader || "";
     document.getElementById("video-duration").textContent = formatTime(currentVideoInfo.duration);
-    document.getElementById("video-transcript-words").textContent = `${data.transcript_segment_count} transcript segments`;
-    document.getElementById("video-summary").textContent = data.summary || "High-retention segments detected.";
-
+    document.getElementById("video-transcript-words").textContent = `${result.transcript_segment_count || 0} transcript segments`;
+    document.getElementById("video-summary").textContent = result.summary || "Best moments detected.";
     overviewSection.classList.remove("hidden");
 
-    // Render Moments
     renderMomentsList(currentMoments);
     momentsSection.classList.remove("hidden");
     momentsSection.scrollIntoView({ behavior: "smooth" });
-
-    showToast(`Found ${currentMoments.length} high-potential viral moments!`);
+    showToast(`Found ${currentMoments.length} clip-ready moments! Now hit "Cut All Reels".`);
   } catch (err) {
     showToast(err.message, "error");
   } finally {
@@ -184,7 +169,24 @@ async function handleAnalyze() {
   }
 }
 
-// 4. Render Moments Cards
+// Poll a background job until done/error
+async function pollJob(jobId, onTick) {
+  if (!jobId) throw new Error("No job id returned by the server.");
+  const started = Date.now();
+  while (true) {
+    await new Promise(r => setTimeout(r, 1500));
+    const res = await fetch(`/api/job/${jobId}`);
+    if (res.status === 404) throw new Error("Job expired or was lost (server restarted?). Try again.");
+    if (!res.ok) throw new Error("Job polling failed.");
+    const job = await res.json();
+    if (onTick) { try { onTick(job); } catch (e) {} }
+    if (job.status === "done") return job.result;
+    if (job.status === "error") throw new Error(job.error || "Background job failed.");
+    if (Date.now() - started > 45 * 60 * 1000) throw new Error("Job timed out after 45 minutes.");
+  }
+}
+
+// 4. Render detected moment cards (title, caption, timeline, srt preview, cut button)
 function renderMomentsList(moments) {
   const grid = document.getElementById("moments-grid");
   grid.innerHTML = "";
@@ -197,514 +199,372 @@ function renderMomentsList(moments) {
     card.innerHTML = `
       <div class="moment-top-row">
         <span class="rank-badge">REEL #${idx + 1}</span>
-        <div class="score-badge" title="Viral Potential Score">
-          <span>🔥</span>
-          <span>${m.viral_score}/100</span>
+        <div class="score-badge" title="Viral potential score">
+          <span>\ud83d\udd25</span><span>${m.viral_score}/100</span>
         </div>
-      </div>
-
-      <div class="hook-banner-preview">
-        <span class="hook-preview-label">HOOK TEXT BANNER</span>
-        <h4 class="hook-headline">"${escapeHtml(m.hook)}"</h4>
+        <span class="timeline-pill" title="Timeline of this part in the source video">\u23f1 ${escapeHtml(m.timeline || (formatTime(m.start_time) + " - " + formatTime(m.end_time)))}</span>
       </div>
 
       <h3 class="moment-title">${escapeHtml(m.title)}</h3>
 
-      <p class="moment-quote">"${escapeHtml(m.key_quote)}"</p>
-      <p class="moment-reason">${escapeHtml(m.reason)}</p>
+      <div class="hook-banner-preview">
+        <span class="hook-preview-label">CAPTION TO POST</span>
+        <p class="caption-text">${escapeHtml(m.caption)}</p>
+      </div>
 
       <div class="time-adjuster-box">
         <div class="time-inputs">
           <label class="control-label">START</label>
-          <input type="number" id="start-time-${idx}" class="time-input-field" value="${m.start_time.toFixed(1)}" step="0.5" onchange="updateDuration(${idx})" />
+          <input type="number" id="start-time-${idx}" class="time-input-field" value="${Number(m.start_time).toFixed(1)}" step="0.5" onchange="updateDuration(${idx})" />
           <label class="control-label">END</label>
-          <input type="number" id="end-time-${idx}" class="time-input-field" value="${m.end_time.toFixed(1)}" step="0.5" onchange="updateDuration(${idx})" />
+          <input type="number" id="end-time-${idx}" class="time-input-field" value="${Number(m.end_time).toFixed(1)}" step="0.5" onchange="updateDuration(${idx})" />
         </div>
-        <span id="duration-badge-${idx}" class="duration-pill">${m.duration.toFixed(1)}s</span>
+        <span id="duration-badge-${idx}" class="duration-pill">${Number(m.duration).toFixed(1)}s</span>
       </div>
 
-      <button id="render-btn-${idx}" class="render-btn" onclick="handleRenderSingle(${idx})">
-        <span class="btn-icon">⚡</span>
-        <span class="btn-text">Render 9:16 Reel</span>
+      <details class="srt-details">
+        <summary>\ud83d\udcac Subtitles (.srt) for this part</summary>
+        <pre id="srt-preview-${idx}" class="srt-preview">Loading subtitles...</pre>
+        <div class="srt-actions">
+          <button type="button" class="secondary-btn tiny-btn" onclick="copySrtOf(${idx})">\ud83d\udccb Copy SRT</button>
+          <button type="button" class="secondary-btn tiny-btn" onclick="downloadSrtOf(${idx})">\u2b07 Download .srt</button>
+        </div>
+      </details>
+
+      <button id="cut-btn-${idx}" class="render-btn" onclick="handleCutSingle(${idx})">
+        <span class="btn-icon">\u2702\ufe0f</span>
+        <span class="btn-text">Cut This Clip (9:16)</span>
       </button>
     `;
 
     grid.appendChild(card);
+
+    // Fetch the SRT for this range once (server caches the transcript per video)
+    fetchSrtFor(idx, Number(m.start_time), Number(m.end_time));
   });
+}
+
+async function fetchSrtFor(idx, start, end) {
+  const vid = (currentVideoInfo && currentVideoInfo.id) || "";
+  const pre = document.getElementById(`srt-preview-${idx}`);
+  try {
+    const res = await fetch(`/api/subtitles/${encodeURIComponent(vid)}?start=${start}&end=${end}`);
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || "no transcript");
+    currentMoments[idx].srt = data.srt || "";
+    if (pre) pre.textContent = data.srt ? data.srt.slice(0, 700) + (data.srt.length > 700 ? "\n\u2026" : "") : "(no speech detected in this range)";
+  } catch (err) {
+    if (pre) pre.textContent = "Subtitles unavailable for this range (no captions on the source video).";
+  }
 }
 
 function updateDuration(idx) {
   const start = parseFloat(document.getElementById(`start-time-${idx}`).value) || 0;
   const end = parseFloat(document.getElementById(`end-time-${idx}`).value) || 0;
-  const dur = Math.max(0, end - start);
-  document.getElementById(`duration-badge-${idx}`).textContent = `${dur.toFixed(1)}s`;
+  document.getElementById(`duration-badge-${idx}`).textContent = `${Math.max(0, end - start).toFixed(1)}s`;
 }
 
-// 5. Render a Single Reel
-async function handleRenderSingle(idx) {
-  const btn = document.getElementById(`render-btn-${idx}`);
-  const originalHtml = btn.innerHTML;
-  btn.disabled = true;
-  btn.innerHTML = `<span class="cyber-spinner" style="width:20px;height:20px;border-width:2px;"></span> Rendering...`;
-
+function buildClipSpec(idx) {
   const m = currentMoments[idx];
-  const customStart = parseFloat(document.getElementById(`start-time-${idx}`).value);
-  const customEnd = parseFloat(document.getElementById(`end-time-${idx}`).value);
-
-  const momentToRender = {
-    ...m,
-    start_time: customStart,
-    end_time: customEnd,
-    duration: customEnd - customStart
+  const start = parseFloat(document.getElementById(`start-time-${idx}`).value);
+  const end = parseFloat(document.getElementById(`end-time-${idx}`).value);
+  if (!(end > start)) {
+    showToast(`Clip ${idx + 1}: end time must be after start time.`, "error");
+    return null;
+  }
+  return {
+    start_time: start,
+    end_time: end,
+    duration: Math.round((end - start) * 10) / 10,
+    title: m.title || "",
+    caption: m.caption || "",
+    timeline: m.timeline || `${formatTime(start)} - ${formatTime(end)}`,
+    viral_score: m.viral_score || 0,
+    key_quote: m.key_quote || "",
+    reason: m.reason || ""
   };
+}
 
-  const withSubtitles = document.getElementById("subtitles-toggle").checked;
-  const withBanner = document.getElementById("banner-toggle").checked;
+// 5. Cut one clip (unedited 9:16 mp4 + .srt + title + caption package)
+async function handleCutSingle(idx) {
+  const spec = buildClipSpec(idx);
+  if (!spec) return;
+  await runCutJob([spec], `Cutting Reel #${idx + 1}...`);
+}
+
+// 6. Cut all detected reels in one batch
+async function handleCutAll() {
+  if (!currentMoments.length) {
+    showToast("Detect the moments first!", "error");
+    return;
+  }
+  const specs = [];
+  for (let i = 0; i < currentMoments.length; i++) {
+    const s = buildClipSpec(i);
+    if (s) specs.push(s);
+  }
+  if (!specs.length) return;
+  await runCutJob(specs, `Cutting ${specs.length} clips...`);
+}
+
+async function runCutJob(clips, startLabel) {
+  const btnAll = document.getElementById("render-all-btn");
+  const progress = document.getElementById("cut-progress");
+  const bar = document.getElementById("cut-progress-bar-fill");
+  const title = document.getElementById("cut-loading-title");
+  const desc = document.getElementById("cut-loading-desc");
+
+  btnAll.disabled = true;
+  btnAll.textContent = "\u23f3 Cutting...";
+  progress.classList.remove("hidden");
+  title.textContent = startLabel;
+  desc.textContent = "Downloading the source video at max quality (cached between batches).";
+  bar.style.width = "2%";
+  progress.scrollIntoView({ behavior: "smooth" });
 
   try {
-    const res = await fetch("/api/render", {
+    const res = await fetch("/api/cut", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         url: currentVideoInfo.webpage_url,
-        video_id: currentVideoInfo.id,
-        moment: momentToRender,
-        with_subtitles: withSubtitles,
-        with_banner: withBanner
+        video_id: currentVideoInfo.id || "",
+        clips
       })
     });
-
     const data = await res.json();
-    if (!res.ok) {
-      throw new Error(data.detail || "Rendering failed.");
-    }
+    if (!res.ok) throw new Error(data.detail || "Cut request failed.");
 
-    showToast(`Reel rendered successfully (${data.size_mb} MB)!`);
-    loadReelsGallery();
-
-    // Open video preview modal
-    openVideoModal({
-      url: data.url,
-      title: momentToRender.title,
-      hook: momentToRender.hook,
-      duration: momentToRender.duration,
-      score: momentToRender.viral_score
+    const result = await pollJob(data.job_id, (job) => {
+      bar.style.width = `${Math.max(2, job.percent || 0)}%`;
+      if (job.message) desc.textContent = job.message;
     });
 
+    showToast(`\u2705 ${result.manifest.clip_count} clip package(s) ready! Downloads below.`);
+    renderResults(result);
+    loadBatches();
   } catch (err) {
     showToast(err.message, "error");
   } finally {
-    btn.disabled = false;
-    btn.innerHTML = originalHtml;
+    progress.classList.add("hidden");
+    btnAll.disabled = false;
+    btnAll.textContent = "\u2702\ufe0f Cut All Reels (9:16)";
   }
 }
 
-// 6. Render All Reels Sequentially
-async function handleRenderAll() {
-  const renderAllBtn = document.getElementById("render-all-btn");
-  renderAllBtn.disabled = true;
-  renderAllBtn.textContent = "Rendering in progress...";
+function renderResults(result) {
+  const manifest = result.manifest;
+  (manifest.clips || []).forEach(c => {
+    if (c.error) {
+      showToast(`Clip ${c.index} failed: ${c.error}`, "error");
+      return;
+    }
+    const idx = c.index - 1;
+    const btn = document.getElementById(`cut-btn-${idx}`);
+    if (btn) {
+      btn.classList.add("done");
+      btn.querySelector(".btn-text").textContent = "\u2705 Clip Ready \u2014 Preview";
+      btn.onclick = () => openClipModal(c);
+    }
+  });
 
-  for (let i = 0; i < currentMoments.length; i++) {
-    showToast(`Rendering Reel #${i + 1} of ${currentMoments.length}...`);
-    await handleRenderSingle(i);
+  let box = document.getElementById("batch-results");
+  if (!box) {
+    box = document.createElement("div");
+    box.id = "batch-results";
+    box.className = "batch-results glass-panel";
+    document.getElementById("moments-grid").after(box);
   }
-
-  renderAllBtn.disabled = false;
-  renderAllBtn.textContent = "🎬 Render All Reels";
-  showToast("All reels rendered and added to library!");
+  box.innerHTML = `
+    <div class="section-header">
+      <div>
+        <h2 class="section-title">\ud83d\udce6 Latest Batch: ${escapeHtml(manifest.video_title || manifest.batch_id)}</h2>
+        <p class="section-subtitle">Unedited 9:16 clips with .srt + title + caption sidecar files.</p>
+      </div>
+      ${result.zip_url ? `<a class="primary-btn zip-btn" href="${result.zip_url}" download>\u2b07\ufe0f Download All as ZIP</a>` : ""}
+    </div>
+  `;
+  const list = document.createElement("div");
+  list.className = "results-list";
+  (manifest.clips || []).filter(c => !c.error).forEach(c => {
+    const row = document.createElement("div");
+    row.className = "result-row";
+    row.innerHTML = `
+      <span class="result-timeline">\u23f1 ${escapeHtml(c.timeline)}</span>
+      <span class="result-title" title="${escapeHtml(c.title)}">${escapeHtml(c.title)}</span>
+      <span class="result-size">${c.size_mb || "?"} MB</span>
+      <a class="tiny-link" href="${c.url}" download>mp4</a>
+      ${c.srt_url ? `<a class="tiny-link" href="${c.srt_url}" download>srt</a>` : ""}
+    `;
+    const preview = document.createElement("button");
+    preview.className = "secondary-btn tiny-btn";
+    preview.textContent = "Preview";
+    preview.onclick = () => openClipModal(c);
+    row.appendChild(preview);
+    list.appendChild(row);
+  });
+  box.appendChild(list);
+  box.scrollIntoView({ behavior: "smooth" });
 }
 
-// Utility to format raw reel filenames into clean display titles
-function cleanFilenameTitle(filename) {
-  if (!filename) return "Viral Reel";
-  let title = filename;
-  title = title.replace(/^reel_[^_]+_/, "");
-  title = title.replace(/^s\d+_e\d+_/, "");
-  title = title.replace(/^score\d+_/, "");
-  title = title.replace(/\.mp4$/i, "");
-  title = title.replace(/[_-]+/g, " ").trim();
-  return title.replace(/\b\w/g, c => c.toUpperCase()) || "Viral Reel";
+// 7. Clip packages gallery (scans the served /clips/ directory listing)
+async function scanClipsDir(path) {
+  const res = await fetch(path);
+  if (!res.ok) return [];
+  const html = await res.text();
+  const doc = new DOMParser().parseFromString(html, "text/html");
+  return Array.from(doc.querySelectorAll("a"))
+    .map(a => decodeURIComponent(a.getAttribute("href")))
+    .filter(h => h && !h.startsWith("?") && !h.startsWith("/"));
 }
 
-let galleryReelsList = [];
-
-// 7. Load Previously Generated Reels Gallery
-async function loadReelsGallery() {
+async function loadBatches() {
   const grid = document.getElementById("gallery-grid");
   const empty = document.getElementById("gallery-empty");
-
   try {
-    const res = await fetch("/api/reels");
-    const data = await res.json();
-    const reels = data.reels || [];
-    galleryReelsList = reels;
+    const entries = await scanClipsDir("/clips/");
+    const dirs = entries.filter(e => e.endsWith("/") && !e.includes("_clips.zip")).map(e => e.replace(/\/$/, ""));
+    const zips = entries.filter(e => e.endsWith("_clips.zip"));
 
-    if (reels.length === 0) {
+    const batches = [];
+    for (const dir of dirs.slice(-12).reverse()) {
+      try {
+        const r = await fetch(`/api/batch/${encodeURIComponent(dir)}`);
+        if (r.ok) batches.push(await r.json());
+      } catch (e) { /* skip broken batch */ }
+    }
+    for (const z of zips.slice(-12).reverse()) {
+      const dir = z.replace(/_clips\.zip$/, "");
+      if (batches.some(b => b.batch_id === dir)) continue;
+      batches.push({ batch_id: dir, zip_only: true, zip_url: `/clips/${z}`, zip_name: z });
+    }
+
+    if (!batches.length) {
       grid.innerHTML = "";
       empty.classList.remove("hidden");
       return;
     }
-
     empty.classList.add("hidden");
     grid.innerHTML = "";
 
-    reels.forEach((r, idx) => {
+    batches.forEach(b => {
       const card = document.createElement("div");
       card.className = "gallery-card glass-panel";
-      card.style.cursor = "pointer";
-
-      const niceTitle = cleanFilenameTitle(r.filename);
-
-      card.innerHTML = `
-        <div class="gallery-preview-wrapper" onclick="openGalleryItemByIndex(${idx})" title="Click to preview & upload">
-          <video class="gallery-video-preview" src="${r.url}#t=0.5" preload="metadata" muted playsinline loop></video>
-          <div class="preview-play-overlay">▶</div>
-        </div>
-        <div class="gallery-card-title" title="${escapeHtml(niceTitle)}">${escapeHtml(niceTitle)}</div>
-        <div class="gallery-card-meta">
-          <span>${r.size_mb} MB</span>
-          <span>9:16 Vertical</span>
-        </div>
-        <div class="gallery-actions">
-          <button type="button" class="preview-reel-btn" onclick="openGalleryItemByIndex(${idx})">▶ Preview</button>
-          <a class="download-reel-btn" href="${r.url}" download="${r.filename}">⬇ Save</a>
-        </div>
-      `;
-
-      // Entire card opens the preview unless clicking the Save download link
-      card.addEventListener("click", (e) => {
-        if (e.target.closest(".download-reel-btn")) return;
-        e.preventDefault();
-        openGalleryItemByIndex(idx);
-      });
-
-      const videoElem = card.querySelector(".gallery-video-preview");
-      card.addEventListener("mouseenter", () => {
-        if (videoElem) videoElem.play().catch(() => {});
-      });
-      card.addEventListener("mouseleave", () => {
-        if (videoElem) {
-          videoElem.pause();
-          videoElem.currentTime = 0.5;
-        }
-      });
-
+      if (b.zip_only) {
+        card.innerHTML = `
+          <div class="gallery-card-title" title="${escapeHtml(b.batch_id)}">${escapeHtml(b.batch_id)}</div>
+          <div class="gallery-card-meta"><span>ZIP package</span><span>9:16 Vertical</span></div>
+          <div class="gallery-actions">
+            <a class="download-reel-btn" href="${b.zip_url}" download="${b.zip_name}">\u2b07 Save ZIP</a>
+          </div>`;
+      } else {
+        const first = (b.clips || []).find(c => c.url);
+        card.innerHTML = `
+          <div class="gallery-preview-wrapper">
+            ${first ? `<video class="gallery-video-preview" src="${first.url}#t=0.5" preload="metadata" muted playsinline loop></video>
+            <div class="preview-play-overlay">\u25b6</div>` : ""}
+          </div>
+          <div class="gallery-card-title" title="${escapeHtml(b.video_title || b.batch_id)}">${escapeHtml(b.video_title || b.batch_id)}</div>
+          <div class="gallery-card-meta">
+            <span>${(b.clips || []).filter(c => !c.error).length} clips</span>
+            <span>9:16 Unedited</span>
+          </div>
+          <div class="gallery-actions">
+            ${first ? `<button type="button" class="preview-reel-btn" onclick='openBatchFirst(${JSON.stringify(first.url)})'>\u25b6 Preview</button>` : ""}
+            <a class="download-reel-btn" href="/clips/${encodeURIComponent(b.batch_id)}_clips.zip" download>\u2b07 Save ZIP</a>
+          </div>`;
+      }
       grid.appendChild(card);
     });
   } catch (err) {
-    console.warn("Could not load reels gallery:", err);
+    console.warn("Could not load clip packages:", err);
   }
 }
 
-function openGalleryItemByIndex(idx) {
-  const r = galleryReelsList[idx];
-  if (!r) return;
-  const niceTitle = cleanFilenameTitle(r.filename);
-  openVideoModal({
-    url: r.url,
-    title: niceTitle,
-    hook: niceTitle.toUpperCase(),
-    duration: 30.0,
-    score: 95
-  });
+function openBatchFirst(url) {
+  openClipModal({ url, title: "Clip", caption: "", timeline: "", srt_text: "" });
 }
+window.openBatchFirst = openBatchFirst;
 
-// 8. Video Modal Handlers
-function openVideoModal(reel) {
-  if (!reel || !reel.url) return;
-  currentModalReel = reel;
+// 8. Clip modal — preview + every deliverable in one place
+function openClipModal(clip) {
+  if (!clip || !clip.url) return;
+  currentModalReel = clip;
   const modal = document.getElementById("video-modal");
   const player = document.getElementById("modal-video-player");
 
-  // Reset upload drawer & status
-  const drawer = document.getElementById("modal-upload-drawer");
-  if (drawer) drawer.classList.add("hidden");
-  const statusBox = document.getElementById("yt-upload-status");
-  if (statusBox) statusBox.classList.add("hidden");
-
-  player.src = reel.url;
+  player.src = clip.url;
   player.load();
-  player.play().catch(e => console.log("Autoplay deferred:", e));
+  player.play().catch(() => {});
 
-  document.getElementById("modal-reel-title").textContent = reel.title || "Viral Reel";
-  document.getElementById("modal-hook-text").textContent = reel.hook ? `"${reel.hook}"` : `"${reel.title || 'VIRAL REEL'}"`;
-  document.getElementById("modal-score-badge").textContent = `${reel.score || 95}/100`;
+  document.getElementById("modal-reel-title").textContent = clip.title || "Clip";
+  document.getElementById("modal-caption-text").textContent = clip.caption || "";
+  const scoreBadge = document.getElementById("modal-score-badge");
+  scoreBadge.textContent = clip.viral_score ? `${clip.viral_score}/100` : "";
+  scoreBadge.style.display = clip.viral_score ? "" : "none";
+  document.getElementById("modal-duration-badge").textContent = clip.duration ? `${Number(clip.duration).toFixed(1)}s` : "";
+  document.getElementById("modal-timeline-badge").textContent = clip.timeline ? `\u23f1 ${clip.timeline}` : "";
 
-  const durText = (typeof reel.duration === "number") ? `${reel.duration.toFixed(1)}s` : "9:16 Vertical";
-  document.getElementById("modal-duration-badge").textContent = durText;
+  const dl = document.getElementById("modal-download-btn");
+  dl.href = clip.url;
+  dl.download = clip.url.split("/").pop();
 
-  const downloadBtn = document.getElementById("modal-download-btn");
-  downloadBtn.href = reel.url;
-  downloadBtn.download = reel.url.split("/").pop();
+  const srtBtn = document.getElementById("modal-srt-btn");
+  if (clip.srt_text) {
+    const blob = new Blob([clip.srt_text], { type: "text/plain;charset=utf-8" });
+    srtBtn.href = URL.createObjectURL(blob);
+    srtBtn.download = (clip.url.split("/").pop() || "clip.mp4").replace(/\.mp4$/i, "") + ".srt";
+    srtBtn.style.display = "";
+  } else if (clip.files && clip.files.srt) {
+    srtBtn.href = clip.url.replace(/[^/]+$/, encodeURIComponent(clip.files.srt));
+    srtBtn.download = clip.files.srt;
+    srtBtn.style.display = "";
+  } else {
+    srtBtn.style.display = "none";
+  }
 
   modal.classList.remove("hidden");
   document.body.style.overflow = "hidden";
 }
-
-function openVideoModalDirect(url, title) {
-  const filename = url ? url.split("/").pop() : "";
-  const cleanTitle = title || cleanFilenameTitle(filename);
-  openVideoModal({
-    url,
-    title: cleanTitle,
-    hook: cleanTitle.toUpperCase(),
-    duration: 30.0,
-    score: 95
-  });
-}
+window.openClipModal = openClipModal;
 
 function closeVideoModal() {
   const modal = document.getElementById("video-modal");
   const player = document.getElementById("modal-video-player");
-  if (player) {
-    player.pause();
-    player.src = "";
-  }
-  if (modal) {
-    modal.classList.add("hidden");
-  }
+  if (player) { player.pause(); player.src = ""; }
+  if (modal) modal.classList.add("hidden");
   document.body.style.overflow = "";
 }
-
-// Expose modal handlers to window for reliable inline and dynamic access
-window.openGalleryItemByIndex = openGalleryItemByIndex;
-window.openVideoModal = openVideoModal;
-window.openVideoModalDirect = openVideoModalDirect;
 window.closeVideoModal = closeVideoModal;
-window.cleanFilenameTitle = cleanFilenameTitle;
 
-function copyHookToClipboard() {
-  const hook = document.getElementById("modal-hook-text").textContent.replace(/"/g, "");
-  navigator.clipboard.writeText(hook).then(() => {
-    showToast("Hook headline copied to clipboard!");
-  });
+function copyModalTitle() {
+  copyText(currentModalReel ? currentModalReel.title : "", "Title");
 }
+window.copyModalTitle = copyModalTitle;
 
-// ===================================================
-// YOUTUBE STUDIO OAUTH & DIRECT UPLOAD
-// ===================================================
-
-let youtubeState = {
-  has_client_secrets: false,
-  is_authenticated: false,
-  channel: null
-};
-
-async function checkYouTubeStatus() {
-  try {
-    const res = await fetch("/api/youtube/status");
-    const data = await res.json();
-    youtubeState = data;
-
-    const btn = document.getElementById("youtube-connect-btn");
-    const label = document.getElementById("youtube-account-label");
-
-    if (data.is_authenticated && data.channel) {
-      btn.classList.add("connected");
-      btn.title = `Connected to ${data.channel.title}. Click to disconnect.`;
-      label.textContent = `🔴 ${data.channel.title}`;
-    } else {
-      btn.classList.remove("connected");
-      btn.title = "Click to link your YouTube channel";
-      label.textContent = "Connect YouTube Studio";
-    }
-  } catch (err) {
-    console.warn("Could not check YouTube status:", err);
-  }
+function copyModalCaption() {
+  copyText(currentModalReel ? currentModalReel.caption : "", "Caption");
 }
+window.copyModalCaption = copyModalCaption;
 
-async function handleYouTubeConnectClick() {
-  if (youtubeState.is_authenticated && youtubeState.channel) {
-    if (confirm(`Connected to YouTube channel "${youtubeState.channel.title}". Do you want to disconnect?`)) {
-      await fetch("/api/youtube/disconnect", { method: "POST" });
-      showToast("YouTube Studio disconnected.");
-      checkYouTubeStatus();
-    }
-    return;
-  }
-
-  if (!youtubeState.has_client_secrets) {
-    const setupModal = document.getElementById("youtube-setup-modal");
-    if (setupModal) {
-      setupModal.classList.remove("hidden");
-      document.body.style.overflow = "hidden";
-    }
-  } else {
-    initiateGoogleOAuth();
-  }
+function copyModalSrt() {
+  copyText(currentModalReel ? (currentModalReel.srt_text || "") : "", "SRT subtitles");
 }
+window.copyModalSrt = copyModalSrt;
 
-function closeYouTubeSetupModal() {
-  const setupModal = document.getElementById("youtube-setup-modal");
-  if (setupModal) {
-    setupModal.classList.add("hidden");
-  }
-  document.body.style.overflow = "";
+function copySrtOf(idx) {
+  copyText(currentMoments[idx] ? (currentMoments[idx].srt || "") : "", "SRT subtitles");
 }
+window.copySrtOf = copySrtOf;
 
-window.closeYouTubeSetupModal = closeYouTubeSetupModal;
-
-async function handleSaveClientSecrets() {
-  const content = document.getElementById("secrets-json-input").value.trim();
-  if (!content) {
-    showToast("Please paste your client_secrets.json content", "error");
-    return;
-  }
-
-  try {
-    const res = await fetch("/api/youtube/secrets", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ content })
-    });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.detail || "Failed to save client secrets");
-
-    showToast("Credentials saved! Redirecting to Google Login...");
-    closeYouTubeSetupModal();
-    initiateGoogleOAuth();
-  } catch (err) {
-    showToast(err.message, "error");
-  }
+function downloadSrtOf(idx) {
+  const m = currentMoments[idx];
+  if (!m || !m.srt) { showToast("No subtitles available for this clip yet.", "error"); return; }
+  const blob = new Blob([m.srt], { type: "text/plain;charset=utf-8" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = `reel_${idx + 1}_${(m.title || "clip").slice(0, 30)}.srt`;
+  a.click();
+  URL.revokeObjectURL(a.href);
 }
-
-async function initiateGoogleOAuth() {
-  try {
-    const res = await fetch("/api/youtube/auth-url");
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.detail || "Failed to get authorization URL");
-    window.location.href = data.auth_url;
-  } catch (err) {
-    showToast(err.message, "error");
-  }
-}
-
-async function generateViralCopy() {
-  if (!currentModalReel) return;
-
-  const rewriteBtn = document.querySelector(".ai-rewrite-btn");
-  if (rewriteBtn) rewriteBtn.textContent = "⏳ Thinking...";
-
-  const rawTitle = currentModalReel.title || currentModalReel.url.split("/").pop();
-  const hook = currentModalReel.hook || "";
-  const quote = currentModalReel.key_quote || "";
-
-  try {
-    const res = await fetch("/api/youtube/suggest-copy", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ raw_title: rawTitle, hook, quote })
-    });
-    const data = await res.json();
-
-    document.getElementById("yt-upload-title").value = data.catchy_title;
-    document.getElementById("yt-upload-desc").value = data.catchy_description;
-
-    const suggestionsBox = document.getElementById("yt-title-suggestions");
-    if (data.alternative_titles && data.alternative_titles.length > 0) {
-      suggestionsBox.innerHTML = `
-        <span style="font-size:0.7rem;color:var(--text-dim);font-weight:700;">CLICK TO USE ALTERNATIVE TITLE:</span>
-      `;
-      data.alternative_titles.forEach(alt => {
-        const pill = document.createElement("div");
-        pill.className = "suggestion-pill";
-        pill.textContent = alt;
-        pill.onclick = () => {
-          document.getElementById("yt-upload-title").value = alt;
-          showToast("Title updated!");
-        };
-        suggestionsBox.appendChild(pill);
-      });
-      suggestionsBox.classList.remove("hidden");
-    }
-  } catch (err) {
-    console.warn("Could not generate viral copy:", err);
-  } finally {
-    if (rewriteBtn) rewriteBtn.textContent = "✨ AI Rewrite";
-  }
-}
-
-function toggleUploadDrawer() {
-  if (!youtubeState.is_authenticated) {
-    handleYouTubeConnectClick();
-    return;
-  }
-
-  const drawer = document.getElementById("modal-upload-drawer");
-  const isHidden = drawer.classList.contains("hidden");
-
-  if (isHidden && currentModalReel) {
-    const cleanTitle = cleanFilenameTitle(currentModalReel.title || currentModalReel.url.split("/").pop());
-    document.getElementById("yt-upload-title").value = `${cleanTitle} 🤯 #Shorts`;
-    document.getElementById("yt-upload-desc").value = `Wait till the end... 👀\n\nWhat would you do in this situation? Drop a comment below! 👇\n\n#Shorts #Viral #Trending #Gaming #Clips`;
-    drawer.classList.remove("hidden");
-
-    // Automatically generate AI viral hooks & alternative titles
-    generateViralCopy();
-  } else {
-    drawer.classList.add("hidden");
-  }
-}
-
-async function executeYouTubeUpload() {
-  if (!currentModalReel) {
-    showToast("No active reel selected", "error");
-    return;
-  }
-
-  const title = document.getElementById("yt-upload-title").value.trim();
-  const description = document.getElementById("yt-upload-desc").value.trim();
-  const privacy = document.getElementById("yt-upload-privacy").value;
-  const filename = currentModalReel.url.split("/").pop();
-
-  const submitBtn = document.getElementById("yt-confirm-upload-btn");
-  const originalHtml = submitBtn.innerHTML;
-  submitBtn.disabled = true;
-  submitBtn.innerHTML = `<span class="cyber-spinner" style="width:14px;height:14px;border-width:2px;display:inline-block;"></span> Uploading...`;
-
-  const statusBox = document.getElementById("yt-upload-status");
-  statusBox.className = "upload-status-box";
-  statusBox.textContent = "Uploading video to YouTube Studio...";
-  statusBox.classList.remove("hidden");
-
-  try {
-    const res = await fetch("/api/youtube/upload", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        filename,
-        title,
-        description,
-        privacy
-      })
-    });
-
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.detail || "Upload failed");
-
-    showToast("🎉 Video successfully uploaded to YouTube Shorts!");
-    statusBox.innerHTML = `
-      <strong>✓ Upload Complete!</strong><br>
-      Published as <strong>${privacy.toUpperCase()}</strong>.<br>
-      <a href="${data.url}" target="_blank" style="color:#67E8F9;font-weight:700;text-decoration:underline;margin-top:6px;display:inline-block;">
-        ▶ Watch Short on YouTube (${data.video_id})
-      </a>
-    `;
-  } catch (err) {
-    showToast(err.message, "error");
-    statusBox.className = "upload-status-box";
-    statusBox.style.background = "rgba(239, 68, 68, 0.2)";
-    statusBox.style.borderColor = "rgba(239, 68, 68, 0.5)";
-    statusBox.style.color = "#FCA5A5";
-    statusBox.textContent = `Upload failed: ${err.message}`;
-  } finally {
-    submitBtn.disabled = false;
-    submitBtn.innerHTML = originalHtml;
-  }
-}
-
-function escapeHtml(str) {
-  if (!str) return "";
-  return str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
-}
+window.downloadSrtOf = downloadSrtOf;
