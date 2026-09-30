@@ -504,10 +504,7 @@ Return ONLY a JSON object:
     try:
         from google import genai
         client = genai.Client(api_key=GEMINI_API_KEY)
-        resp = client.models.generate_content(
-            model="gemini-3.8-flash",
-            contents=prompt,
-        )
+        resp = client.chats.create(model="gemini-3.8-flash").send_message(prompt)
         text = resp.text
         text = re.sub(r'^```json\s*', '', text.strip(), flags=re.MULTILINE)
         text = re.sub(r'```$', '', text.strip(), flags=re.MULTILINE)

@@ -171,11 +171,13 @@ def _call_gemini(system: str, prompt: str, api_key: str, model_name: str) -> str
     last_error = None
     for m in models_to_try:
         try:
-            resp = client.models.generate_content(
+            # Recommended pattern: system instruction + temperature live on the
+            # chat, and we send exactly one user turn (no function calling).
+            chat = client.chats.create(
                 model=m,
-                contents=prompt,
                 config=types.GenerateContentConfig(system_instruction=system, temperature=0.3),
             )
+            resp = chat.send_message(prompt)
             if resp and resp.text:
                 return resp.text
         except Exception as e:  # rate limited / unknown model -> next candidate
