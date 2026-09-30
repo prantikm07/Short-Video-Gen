@@ -3,11 +3,19 @@ import re
 import sys
 from pathlib import Path
 from typing import Optional, List
+import json
+import shutil
+import threading
+import zipfile
+from typing import Any, Dict
+
 from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, RedirectResponse
-from pydantic import BaseModel
+from fastapi.responses import FileResponse, RedirectResponse, JSONResponse
+from pydantic import BaseModel, Field
 import youtube_uploader
+
+import jobs
 
 # Ensure parent directory is on python path to import existing modules
 CURRENT_DIR = Path(__file__).resolve().parent
@@ -31,8 +39,8 @@ from downloader import (
     download_video,
 )
 from models import ViralMoment, TranscriptSegment
-from viral_detector import detect_viral_moments
-from video_processor import render_reel
+from viral_detector import detect_viral_moments, format_seconds
+from video_processor import cut_clip_916, generate_srt
 
 app = FastAPI(title="ViralReel AI Studio")
 
@@ -51,6 +59,10 @@ STATIC_DIR.mkdir(parents=True, exist_ok=True)
 
 # Mount generated reels for direct browser streaming and download
 app.mount("/output", StaticFiles(directory=str(OUTPUT_DIR)), name="output")
+# Mount per-batch clip folders (mp4 + .srt + caption text) for download
+CLIPS_DIR = OUTPUT_DIR / "clips"
+CLIPS_DIR.mkdir(parents=True, exist_ok=True)
+app.mount("/clips", StaticFiles(directory=str(CLIPS_DIR)), name="clips")
 # Mount static UI assets
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
@@ -63,10 +75,38 @@ async def favicon():
 
 class AnalyzeRequest(BaseModel):
     url: str
-    count: int = 3
+    count: int = Field(default=3, ge=1, le=10)
     engine: str = "auto"
     min_duration: float = DEFAULT_MIN_DURATION
     max_duration: float = DEFAULT_MAX_DURATION
+
+
+class ClipSpec(BaseModel):
+    """One clip the user wants cut out of an already analyzed video."""
+    start_time: float
+    end_time: float
+    title: str = ""
+    caption: str = ""
+    timeline: str = ""
+    viral_score: int = 0
+    key_quote: str = ""
+    reason: str = ""
+
+    def to_moment(self) -> ViralMoment:
+        return ViralMoment(
+            title=self.title, caption=self.caption, timeline=self.timeline,
+            start_time=float(self.start_time), end_time=float(self.end_time),
+            duration=round(float(self.end_time) - float(self.start_time), 2),
+            viral_score=self.viral_score, key_quote=self.key_quote, reason=self.reason,
+        )
+
+
+class CutRequest(BaseModel):
+    url: str
+    video_id: str = ""
+    batch_id: str = ""
+    clips: List[ClipSpec]
+
 
 class RenderRequest(BaseModel):
     url: str
@@ -93,114 +133,269 @@ def get_status():
         "default_engine": default_engine,
     }
 
-@app.post("/api/analyze")
-def analyze_video(req: AnalyzeRequest):
+# ---------------------------------------------------------------------------
+# Job polling + analysis background worker
+# ---------------------------------------------------------------------------
+
+@app.get("/api/job/{job_id}")
+def get_job(job_id: str):
+    """Poll progress of an analyze / cut job."""
+    job = jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found or expired.")
+    return job
+
+
+_ANALYSIS_CACHE: Dict[str, Dict[str, Any]] = {}
+
+
+def _run_analysis(job_id: str, req: AnalyzeRequest):
     try:
+        jobs.update(job_id, stage="metadata", message="Fetching video info...", percent=5)
         video_id = extract_video_id(req.url)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Invalid YouTube URL: {str(e)}")
-
-    try:
         info = get_video_info(req.url)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to fetch video information: {str(e)}")
 
-    try:
+        jobs.update(job_id, stage="transcript", message="Downloading captions / transcript...", percent=12)
         segments = get_transcript(video_id)
-        formatted_transcript = format_transcript_for_prompt(segments)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Could not extract transcript for video: {str(e)}")
 
-    try:
+        jobs.update(job_id, stage="ai", message="AI is scanning for the best moments...", percent=18)
         analysis = detect_viral_moments(
             title=info.get("title", "Untitled"),
             uploader=info.get("uploader", "Unknown"),
             duration=info.get("duration", 0),
-            formatted_transcript=formatted_transcript,
+            segments=segments,
             count=req.count,
             min_duration=req.min_duration,
             max_duration=req.max_duration,
             engine=req.engine,
+            progress_cb=jobs.make_cb(job_id, base=18, span=72),
         )
+
+        payload = {
+            "video_id": video_id,
+            "video_info": info,
+            "viral_moments": [m.model_dump() for m in analysis.viral_moments],
+            "summary": analysis.video_summary,
+            "transcript_segment_count": len(segments),
+        }
+        _ANALYSIS_CACHE[video_id] = payload
+        if len(_ANALYSIS_CACHE) > 12:
+            for k in list(_ANALYSIS_CACHE)[:2]:
+                _ANALYSIS_CACHE.pop(k, None)
+        jobs.finish(job_id, payload)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"AI virality analysis failed: {str(e)}")
+        jobs.fail(job_id, str(e))
 
-    return {
-        "video_info": info,
-        "viral_moments": analysis.viral_moments,
-        "summary": analysis.video_summary,
-        "transcript_segment_count": len(segments),
-    }
 
-@app.post("/api/render")
-def render_reel_endpoint(req: RenderRequest):
+@app.post("/api/analyze")
+def analyze_video(req: AnalyzeRequest):
+    """Start AI moment detection. Returns a job id to poll at /api/job/{id}."""
     try:
         video_id = extract_video_id(req.url)
-    except Exception:
-        video_id = req.video_id
-
-    source_video_path = TEMP_DIR / f"{video_id}.mp4"
-    if not source_video_path.exists():
-        try:
-            download_video(req.url, source_video_path)
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Video download failed: {str(e)}")
-
-    # Fetch transcript segments for subtitles if requested
-    all_segments = None
-    if req.with_subtitles:
-        try:
-            all_segments = get_transcript(video_id)
-        except Exception:
-            all_segments = None
-
-    clean_title = re.sub(r'[^\w\s-]', '', req.moment.title).strip()
-    clean_title = re.sub(r'[-\s]+', '_', clean_title)[:35]
-    out_filename = f"reel_{video_id}_s{int(req.moment.start_time)}_e{int(req.moment.end_time)}_{clean_title}.mp4"
-    output_file = OUTPUT_DIR / out_filename
-
-    try:
-        render_reel(
-            source_video_path=source_video_path,
-            moment=req.moment,
-            output_file=output_file,
-            all_segments=all_segments,
-            with_subtitles=req.with_subtitles,
-            with_hook_banner=req.with_banner,
-        )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Rendering failed: {str(e)}")
+        raise HTTPException(status_code=400, detail=f"Invalid YouTube URL: {str(e)}")
+    if not (GEMINI_API_KEY or ANTHROPIC_API_KEY):
+        raise HTTPException(status_code=400, detail="No API key configured. Add GEMINI_API_KEY to your .env file.")
+    if req.min_duration > req.max_duration:
+        raise HTTPException(status_code=400, detail="Min seconds must be smaller than max seconds.")
 
-    file_size_mb = round(output_file.stat().st_size / (1024 * 1024), 2)
+    cached = _ANALYSIS_CACHE.get(video_id)
+    if cached and len(cached.get("viral_moments", [])) >= req.count:
+        return {"job_id": None, "cached": True, "result": cached}
+
+    job_id = jobs.create_job("analyze", {"video_id": video_id})
+    threading.Thread(target=_run_analysis, args=(job_id, req), daemon=True).start()
+    return {"job_id": job_id, "cached": False}
+
+
+# ---------------------------------------------------------------------------
+# Cutting: unedited 9:16 clip + .srt sidecar + title/caption package
+# ---------------------------------------------------------------------------
+
+def _safe_name(text: str, limit: int = 45) -> str:
+    text = re.sub(r"[^\w\s-]", "", text or "").strip()
+    text = re.sub(r"[-\s]+", "_", text)
+    return text[:limit] or "clip"
+
+
+def _batch_dir(batch_id: str) -> Path:
+    d = CLIPS_DIR / batch_id
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _ensure_source(url: str, video_id: str, job_id: str) -> Path:
+    source = TEMP_DIR / f"{video_id}.mp4"
+    if source.exists() and source.stat().st_size > 1_000_000:
+        return source
+    jobs.update(job_id, message="Downloading source video (max resolution)...", percent=6)
+    try:
+        download_video(url, source)
+    except Exception as e:
+        raise RuntimeError(f"Video download failed: {e}")
+    if not source.exists():
+        raise RuntimeError("Video download produced no file.")
+    return source
+
+
+def _ensure_segments(video_id: str) -> List[TranscriptSegment]:
+    try:
+        return get_transcript(video_id)
+    except Exception:
+        return []
+
+
+def _write_clip_package_files(clip_dir: Path, index: int, spec: ClipSpec, srt_path: Path,
+                              video_filename: str, info: Dict[str, Any]) -> Dict[str, Any]:
+    """Write title.txt / caption.txt next to the mp4 + srt so everything is downloadable."""
+    timeline = spec.timeline or f"{format_seconds(spec.start_time)} - {format_seconds(spec.end_time)}"
+    title_txt = clip_dir / f"{index:02d}_title.txt"
+    caption_txt = clip_dir / f"{index:02d}_caption.txt"
+    title_txt.write_text(f"{spec.title}\n({timeline})\n", encoding="utf-8")
+    caption_txt.write_text(f"{spec.caption or spec.title}\n", encoding="utf-8")
+    files = {
+        "video": video_filename,
+        "srt": srt_path.name if srt_path else None,
+        "title_file": title_txt.name,
+        "caption_file": caption_txt.name,
+    }
     return {
-        "success": True,
-        "filename": out_filename,
-        "url": f"/output/{out_filename}",
-        "size_mb": file_size_mb,
-        "duration": req.moment.duration,
+        "index": index,
+        "title": spec.title,
+        "caption": spec.caption,
+        "timeline": timeline,
+        "start_time": spec.start_time,
+        "end_time": spec.end_time,
+        "duration": round(spec.end_time - spec.start_time, 2),
+        "srt_text": srt_path.read_text(encoding="utf-8") if srt_path and srt_path.exists() else "",
+        "files": files,
     }
 
-@app.get("/api/reels")
-def list_reels():
-    reels = []
-    for f in OUTPUT_DIR.glob("*.mp4"):
-        if f.name.endswith(".rendering.mp4"):
-            continue
-        stat = f.stat()
-        if stat.st_size < 10000:
+
+def _run_cut(job_id: str, req: CutRequest):
+    try:
+        video_id = req.video_id or extract_video_id(req.url)
+        batch_id = req.batch_id or video_id
+        clip_dir = _batch_dir(batch_id)
+
+        source = _ensure_source(req.url, video_id, job_id)
+        segments = _ensure_segments(video_id)
+        info = {"id": video_id}
+        try:
+            info = get_video_info(req.url)
+        except Exception:
+            pass
+
+        total = max(1, len(req.clips))
+        delivered = []
+        for i, spec in enumerate(req.clips, start=1):
+            jobs.update(job_id, message=f"Cutting clip {i}/{total} ({format_seconds(spec.start_time)} - {format_seconds(spec.end_time)})...",
+                        percent=10 + (80 * (i - 1) / total))
+            stem = f"{i:02d}_{_safe_name(spec.title)}_{int(spec.start_time)}-{int(spec.end_time)}s"
+            out_video = clip_dir / f"{stem}.mp4"
+            moment = spec.to_moment()
             try:
-                f.unlink()
-            except Exception:
-                pass
-            continue
-        reels.append({
-            "filename": f.name,
-            "url": f"/output/{f.name}",
-            "size_mb": round(stat.st_size / (1024 * 1024), 2),
-            "created_at": stat.st_mtime,
-        })
-    reels.sort(key=lambda r: r["created_at"], reverse=True)
-    return {"reels": reels}
+                cut_clip_916(source, moment.start_time, moment.end_time, out_video)
+            except Exception as e:
+                delivered.append({"index": i, "error": str(e)[:300]})
+                continue
+
+            srt_path = None
+            if segments:
+                srt_path = clip_dir / f"{stem}.srt"
+                try:
+                    generate_srt(moment, segments, srt_path)
+                except Exception as e:
+                    print(f"[warn] srt generation failed for clip {i}: {e}")
+                    srt_path = None
+
+            rel_dir = f"clips/{batch_id}"
+            entry = _write_clip_package_files(clip_dir, i, spec, srt_path, out_video.name, info)
+            entry["url"] = f"/{rel_dir}/{out_video.name}"
+            if srt_path:
+                entry["srt_url"] = f"/{rel_dir}/{srt_path.name}"
+            entry["size_mb"] = round(out_video.stat().st_size / (1024 * 1024), 2)
+            entry["dir_url"] = f"/{rel_dir}/"
+            delivered.append(entry)
+
+        manifest = {
+            "batch_id": batch_id,
+            "video_id": video_id,
+            "video_title": info.get("title", ""),
+            "clip_count": len([d for d in delivered if "url" in d]),
+            "clips": delivered,
+        }
+        (clip_dir / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        jobs.update(job_id, message="Packaging downloads...", percent=95)
+        zip_name = f"{batch_id}_clips.zip"
+        zip_path = CLIPS_DIR / zip_name
+        try:
+            with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_STORED) as zf:
+                for f in sorted(clip_dir.iterdir()):
+                    if f.is_file() and f.name != "manifest.json":
+                        zf.write(f, arcname=f"{batch_id}/{f.name}")
+            zip_url = f"/clips/{zip_name}"
+        except Exception as e:
+            print(f"[warn] zip creation failed: {e}")
+            zip_url = None
+
+        jobs.finish(job_id, {"manifest": manifest, "zip_url": zip_url, "zip_name": zip_name if zip_url else None})
+    except Exception as e:
+        jobs.fail(job_id, str(e))
+
+
+@app.post("/api/cut")
+def cut_clips(req: CutRequest):
+    """Cut the requested clips: unedited 9:16 mp4 + .srt + title + caption each."""
+    if not req.clips:
+        raise HTTPException(status_code=400, detail="No clips requested.")
+    if len(req.clips) > 10:
+        raise HTTPException(status_code=400, detail="Maximum 10 clips per batch.")
+    try:
+        video_id = req.video_id or extract_video_id(req.url)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid YouTube URL: {str(e)}")
+    for c in req.clips:
+        if c.end_time <= c.start_time:
+            raise HTTPException(status_code=400, detail=f"Clip '{c.title}' has end time before start time.")
+        if c.start_time < 0:
+            raise HTTPException(status_code=400, detail="Start time cannot be negative.")
+
+    batch_id = re.sub(r"[^\w-]", "_", req.batch_id or f"{video_id}_{jobs.create_job('batch')}")[:40]
+    job_id = jobs.create_job("cut", {"video_id": video_id, "batch_id": batch_id})
+    req.batch_id = batch_id
+    req.video_id = video_id
+    threading.Thread(target=_run_cut, args=(job_id, req), daemon=True).start()
+    return {"job_id": job_id, "batch_id": batch_id}
+
+
+@app.get("/api/batch/{batch_id}")
+def get_batch(batch_id: str):
+    safe = re.sub(r"[^\w-]", "", batch_id)
+    manifest = CLIPS_DIR / safe / "manifest.json"
+    if not manifest.exists():
+        raise HTTPException(status_code=404, detail="Batch not found.")
+    return json.loads(manifest.read_text(encoding="utf-8"))
+
+
+@app.get("/api/subtitles/{video_id}")
+def subtitles_for_range(video_id: str, start: float, end: float):
+    """SRT text for any arbitrary range (used by the per-clip 'copy SRT' button)."""
+    safe_id = re.sub(r"[^0-9A-Za-z_-]", "", video_id)
+    segments = _ensure_segments(safe_id)
+    if not segments:
+        raise HTTPException(status_code=400, detail="No transcript available for this video.")
+    spec = ClipSpec(start_time=start, end_time=end)
+    tmp = TEMP_DIR / f"srt_{safe_id}_{int(start)}_{int(end)}.srt"
+    generate_srt(spec.to_moment(), segments, tmp)
+    text = tmp.read_text(encoding="utf-8")
+    try:
+        tmp.unlink()
+    except Exception:
+        pass
+    return {"srt": text, "timeline": f"{format_seconds(start)} - {format_seconds(end)}"}
+
 
 # ===================================================
 # YOUTUBE STUDIO DIRECT UPLOAD ENDPOINTS
